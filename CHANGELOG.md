@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.13.1 - 2026-08-04
+
 + [新增] 默认模型渠道新增 Google 渠道并预置六个 Gemini 图片模型，原默认渠道重命名为 OpenAI。
 + [调整] OpenAI 与 Google 默认渠道的接口地址统一为 `https://direct.foropencode.com`。
 
