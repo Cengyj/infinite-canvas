@@ -5,6 +5,8 @@ description: 当前版本已实现但仍需人工验证的变更项
 
 # 待测试
 
+- 默认模型渠道：在没有本地持久化配置的新浏览器中打开「配置与用户偏好」，渠道列表应依次显示 `OpenAI` 和 `Google`；两者接口地址均为 `https://direct.foropencode.com`，OpenAI 保留原有模型和默认选择，Google 使用 Gemini 协议，并依次包含 `gemini-2.5-flash-image-preview`、`gemini-3-pro-image`、`gemini-3-pro-image-preview`、`gemini-2.5-flash-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-image-preview` 六个图片模型，能力均为生图；API Key 输入提示应适用于两类渠道，已有本地渠道配置不应被覆盖。
+- OpenAI 默认接口地址：在没有本地持久化配置的新浏览器中打开「配置与用户偏好」，OpenAI 渠道、新增 OpenAI 渠道及切换为 OpenAI 协议时的接口地址应为 `https://direct.foropencode.com`；Gemini、火山方舟和其余用户偏好保持不变，已有本地渠道配置不应被覆盖。
 - 画布节点缩放稳定性：选中任意节点并反复拖动四角缩放时，节点工具条应在缩放期间隐藏、松开后恢复，页面不应再出现 `Maximum update depth exceeded`。
 - Agent MCP 初始化状态：首次进入空白对话或点击「新对话」后，无需先发送消息，对话区应立即显示 Codex 会话准备，并同时列出 `codex_apps`、`infinite-canvas`、`node_repl` 等全部 MCP 服务各自的启动、就绪或失败状态；初始化期间可输入并保留草稿，但发送按钮、上传和回车提交应禁用，全部完成后显示服务数量、恢复发送并复用同一个预热线程；右侧日志应记录同样的真实状态，`starting` 与 `ready` 归入信息且就绪显示绿色成功图标，只有 `failed` 归入错误、`cancelled` 归入警告，模型开始处理后不应残留初始化文案。
 - Agent 模型设置：连接 Canvas Agent 后，输入框左下方应显示当前 Codex 模型与推理强度；模型列表应来自当前账号实际可用模型且不显示内部审查模型或重复项，切换模型后强度选项随模型能力更新且无空白选项，刷新页面后保留选择，发送任务时实际使用所选模型和强度；本地控制台与右侧「日志」应记录本轮使用的模型和推理强度。

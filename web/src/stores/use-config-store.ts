@@ -62,7 +62,7 @@ export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webd
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 const CHANNEL_MODEL_SEPARATOR = "::";
-const OPENAI_BASE_URL = "https://api.openai.com";
+const OPENAI_BASE_URL = "https://direct.foropencode.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
 const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 
@@ -74,7 +74,7 @@ export const defaultConfig: AiConfig = {
     channels: [
         {
             id: "default",
-            name: "默认渠道",
+            name: "OpenAI",
             baseUrl: OPENAI_BASE_URL,
             apiKey: "",
             apiFormat: "openai",
@@ -83,6 +83,21 @@ export const defaultConfig: AiConfig = {
                 { name: "grok-imagine-video", capability: "video" },
                 { name: "gpt-5.5", capability: "text" },
                 { name: "gpt-4o-mini-tts", capability: "audio" },
+            ],
+        },
+        {
+            id: "google",
+            name: "Google",
+            baseUrl: OPENAI_BASE_URL,
+            apiKey: "",
+            apiFormat: "gemini",
+            models: [
+                { name: "gemini-2.5-flash-image-preview", capability: "image" },
+                { name: "gemini-3-pro-image", capability: "image" },
+                { name: "gemini-3-pro-image-preview", capability: "image" },
+                { name: "gemini-2.5-flash-image", capability: "image" },
+                { name: "gemini-3.1-flash-image", capability: "image" },
+                { name: "gemini-3.1-flash-image-preview", capability: "image" },
             ],
         },
     ],
@@ -101,7 +116,18 @@ export const defaultConfig: AiConfig = {
     videoWatermark: "false",
     systemPrompt: "",
     reasoningEffort: "auto",
-    models: ["default::gpt-image-2", "default::grok-imagine-video", "default::gpt-5.5", "default::gpt-4o-mini-tts"],
+    models: [
+        "default::gpt-image-2",
+        "default::grok-imagine-video",
+        "default::gpt-5.5",
+        "default::gpt-4o-mini-tts",
+        "google::gemini-2.5-flash-image-preview",
+        "google::gemini-3-pro-image",
+        "google::gemini-3-pro-image-preview",
+        "google::gemini-2.5-flash-image",
+        "google::gemini-3.1-flash-image",
+        "google::gemini-3.1-flash-image-preview",
+    ],
     quality: "auto",
     size: "1:1",
     background: "",
@@ -219,7 +245,6 @@ export const useConfigStore = create<ConfigStore>()(
                 const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
                 const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
                 const config = { ...defaultConfig, ...persistedConfig };
-                if (!Array.isArray(persistedConfig.channels)) config.channels = [];
                 const channels = normalizeChannels(config);
                 const models = modelOptionsFromChannels(channels);
                 return {
@@ -329,7 +354,7 @@ export function resolveModelChannel(config: AiConfig, value: string) {
     const decoded = decodeChannelModel(value);
     const model = decoded?.model || value;
     const matched = decoded ? config.channels.find((channel) => channel.id === decoded.channelId) : config.channels.find((channel) => channel.models.some((item) => item.name === model));
-    return matched || config.channels[0] || createModelChannel({ id: "default", name: "默认渠道", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
+    return matched || config.channels[0] || createModelChannel({ id: "default", name: "OpenAI", baseUrl: config.baseUrl, apiKey: config.apiKey, apiFormat: config.apiFormat, models: config.models.map(modelOptionName).map((name) => ({ name, capability: guessCapability(name) })) });
 }
 
 export function resolveModelRequestConfig(config: AiConfig, value: string) {
@@ -349,7 +374,7 @@ function normalizeChannels(config: AiConfig) {
         createModelChannel({
             ...channel,
             id: channel.id || (index === 0 ? "default" : `channel-${index + 1}`),
-            name: channel.name || (index === 0 ? "默认渠道" : `渠道 ${index + 1}`),
+            name: channel.name || (index === 0 ? "OpenAI" : `渠道 ${index + 1}`),
             models: normalizeChannelModels(channel.models),
         }),
     );
@@ -357,7 +382,7 @@ function normalizeChannels(config: AiConfig) {
         channels.push(
             createModelChannel({
                 id: "default",
-                name: "默认渠道",
+                name: "OpenAI",
                 baseUrl: config.baseUrl || defaultConfig.baseUrl,
                 apiKey: config.apiKey || "",
                 apiFormat: config.apiFormat || defaultConfig.apiFormat,
