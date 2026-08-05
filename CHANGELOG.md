@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.13.2 - 2026-08-05
+
++ [调整] GitHub Actions 应用镜像改为发布至 `ghcr.io/cengyj/infinite-canvas` 并仅构建 `linux/amd64`（x86_64）。
++ [修复] 修复 Gemini 原生图片生成请求混用响应格式枚举容器，导致宽高比与输出尺寸未按 ImageConfig 协议传递的问题。
+
 ## v0.13.1 - 2026-08-04
 
 + [新增] 默认模型渠道新增 Google 渠道并预置六个 Gemini 图片模型，原默认渠道重命名为 OpenAI。

@@ -5,6 +5,8 @@ description: 当前版本已实现但仍需人工验证的变更项
 
 # 待测试
 
+- GitHub x86_64 镜像：推送版本 tag 后，`Docker image` 工作流应成功构建并发布 `ghcr.io/cengyj/infinite-canvas:<版本号>`，镜像平台应为 `linux/amd64`，在 x86_64 主机映射 `3000` 端口后应能正常访问。
+- Gemini 原生图片生成参数：选择 Gemini 渠道图片模型后，分别验证文生图和无蒙版参考图生图；设置非默认宽高比及支持输出尺寸模型的图片质量时，请求应发送到所选模型运行时渠道的 `models/{model}:generateContent`，`generationConfig` 应保留 `responseModalities`，并通过 `imageConfig.aspectRatio` 和 `imageConfig.imageSize` 传递字符串参数，不应同时出现 `responseFormat.image`。
 - 默认模型渠道：在没有本地持久化配置的新浏览器中打开「配置与用户偏好」，渠道列表应依次显示 `OpenAI` 和 `Google`；两者接口地址均为 `https://direct.foropencode.com`，OpenAI 保留原有模型和默认选择，Google 使用 Gemini 协议，并依次包含 `gemini-2.5-flash-image-preview`、`gemini-3-pro-image`、`gemini-3-pro-image-preview`、`gemini-2.5-flash-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-image-preview` 六个图片模型，能力均为生图；API Key 输入提示应适用于两类渠道，已有本地渠道配置不应被覆盖。
 - OpenAI 默认接口地址：在没有本地持久化配置的新浏览器中打开「配置与用户偏好」，OpenAI 渠道、新增 OpenAI 渠道及切换为 OpenAI 协议时的接口地址应为 `https://direct.foropencode.com`；Gemini、火山方舟和其余用户偏好保持不变，已有本地渠道配置不应被覆盖。
 - 画布节点缩放稳定性：选中任意节点并反复拖动四角缩放时，节点工具条应在缩放期间隐藏、松开后恢复，页面不应再出现 `Maximum update depth exceeded`。
