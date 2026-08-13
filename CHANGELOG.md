@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.15.3 - 2026-08-13
+
++ [修复] 修正 GitHub Actions、Docker Compose 与部署文档的 GHCR 命名空间，并恢复仅构建 `linux/amd64` 镜像。
+
 ## v0.15.2 - 2026-08-13
 
 + [优化] 默认模型渠道预置 OpenAI 与 Google 两个渠道及对应模型，并统一使用 `https://direct.foropencode.com`。
