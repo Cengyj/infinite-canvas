@@ -5,7 +5,7 @@ import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
 
-export type ApiCallFormat = "openai" | "gemini" | "ark";
+export type ApiCallFormat = "openai" | "gemini";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 export type ReasoningEffort = "auto" | "low" | "medium" | "high" | "xhigh";
 
@@ -63,10 +63,10 @@ export type WebdavSyncConfig = {
 export type ConfigTabKey = "channels" | "preferences" | "prompt-sources" | "webdav" | "local-storage";
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
+const CONFIG_STORE_VERSION = 1;
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://direct.foropencode.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
-const ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 
 export const defaultConfig: AiConfig = {
     channelMode: "local",
@@ -95,10 +95,7 @@ export const defaultConfig: AiConfig = {
             apiFormat: "gemini",
             models: [
                 { name: "gemini-2.5-flash-image-preview", capability: "image" },
-                { name: "gemini-3-pro-image", capability: "image" },
                 { name: "gemini-3-pro-image-preview", capability: "image" },
-                { name: "gemini-2.5-flash-image", capability: "image" },
-                { name: "gemini-3.1-flash-image", capability: "image" },
                 { name: "gemini-3.1-flash-image-preview", capability: "image" },
             ],
         },
@@ -124,10 +121,7 @@ export const defaultConfig: AiConfig = {
         "default::gpt-5.5",
         "default::gpt-4o-mini-tts",
         "google::gemini-2.5-flash-image-preview",
-        "google::gemini-3-pro-image",
         "google::gemini-3-pro-image-preview",
-        "google::gemini-2.5-flash-image",
-        "google::gemini-3.1-flash-image",
         "google::gemini-3.1-flash-image-preview",
     ],
     quality: "auto",
@@ -153,13 +147,18 @@ type ConfigStore = {
     shouldPromptContinue: boolean;
     updateConfig: <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
     updateWebdavConfig: <K extends keyof WebdavSyncConfig>(key: K, value: WebdavSyncConfig[K]) => void;
+    replaceConfig: (config: Partial<AiConfig>, webdav?: Partial<WebdavSyncConfig>) => void;
     isAiConfigReady: (config: AiConfig, model: string) => boolean;
     openConfigDialog: (shouldPromptContinue?: boolean, tab?: ConfigTabKey) => void;
     setConfigDialogOpen: (isOpen: boolean) => void;
     clearPromptContinue: () => void;
 };
 
-const VIDEO_KEYWORDS = ["seedance", "video", "sora", "veo", "kling", "wan", "hailuo"];
+const VIDEO_KEYWORDS = ["video", "sora", "veo", "kling", "wan", "hailuo"];
+
+export function boolConfig(value: string, fallback: boolean) {
+    return value ? value === "true" : fallback;
+}
 const AUDIO_KEYWORDS = ["audio", "tts", "speech", "voice", "music", "sound"];
 const IMAGE_KEYWORDS = ["seedream", "gpt-image", "image", "dall-e", "dalle", "imagen", "flux", "sdxl", "stable-diffusion", "midjourney"];
 
@@ -194,7 +193,8 @@ export function resolveModelForCapability(config: AiConfig, currentModel: string
     const fallbackModel = capability === "image" ? defaultConfig.imageModel : capability === "video" ? defaultConfig.videoModel : capability === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
     if (currentModel && modelMatchesCapability(config, currentModel, capability)) return currentModel;
     if (defaultModel && modelMatchesCapability(config, defaultModel, capability)) return defaultModel;
-    return fallbackModel;
+    if (fallbackModel && modelMatchesCapability(config, fallbackModel, capability)) return fallbackModel;
+    return selectableModelsByCapability(config, capability)[0] || "";
 }
 
 export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
@@ -234,6 +234,11 @@ export const useConfigStore = create<ConfigStore>()(
                         [key]: value,
                     },
                 })),
+            replaceConfig: (config, webdav) =>
+                set((state) => ({
+                    config: normalizeAiConfig(config),
+                    webdav: webdav ? normalizeWebdavSyncConfig(webdav) : state.webdav,
+                })),
             isAiConfigReady: (config, model) => isAiConfigReady(config, model),
             openConfigDialog: (shouldPromptContinue = false, configTab = "channels") => set({ isConfigOpen: true, shouldPromptContinue, configTab }),
             setConfigDialogOpen: (isConfigOpen) => set({ isConfigOpen }),
@@ -241,43 +246,62 @@ export const useConfigStore = create<ConfigStore>()(
         }),
         {
             name: CONFIG_STORE_KEY,
+            version: CONFIG_STORE_VERSION,
+            migrate: (persisted, version) => {
+                if (version !== 0) throw new Error(`Unsupported config store version: ${version}`);
+                return persisted as Pick<ConfigStore, "config" | "webdav">;
+            },
             partialize: (state) => ({ config: state.config, webdav: state.webdav }),
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<ConfigStore>;
-                const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
-                const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
-                const config = { ...defaultConfig, ...persistedConfig };
-                const channels = normalizeChannels(config);
-                const models = modelOptionsFromChannels(channels);
                 return {
                     ...current,
-                    webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
-                    config: {
-                        ...config,
-                        channelMode: "local",
-                        apiFormat: normalizeApiFormat(config.apiFormat),
-                        channels,
-                        models,
-                        imageModel: normalizeModelOptionValue(config.imageModel || config.model, channels),
-                        videoModel: normalizeModelOptionValue(config.videoModel, channels),
-                        textModel: normalizeModelOptionValue(config.textModel || config.model, channels),
-                        audioModel: normalizeModelOptionValue(config.audioModel || defaultConfig.audioModel, channels),
-                        audioVoice: config.audioVoice || defaultConfig.audioVoice,
-                        audioFormat: config.audioFormat || defaultConfig.audioFormat,
-                        audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
-                        audioInstructions: config.audioInstructions || "",
-                        reasoningEffort: config.reasoningEffort || "auto",
-                        videoSeconds: config.videoSeconds || "6",
-                        vquality: config.vquality || "720",
-                        videoGenerateAudio: config.videoGenerateAudio || "true",
-                        videoWatermark: config.videoWatermark || "false",
-                        canvasImageCount: config.canvasImageCount || "3",
-                    },
+                    config: normalizeAiConfig(persistedState.config),
+                    webdav: normalizeWebdavSyncConfig(persistedState.webdav),
                 };
             },
         },
     ),
 );
+
+export function normalizeAiConfig(persistedConfig?: Partial<AiConfig>): AiConfig {
+    const config = { ...defaultConfig, ...persistedConfig };
+    if (persistedConfig && !Array.isArray(persistedConfig.channels)) config.channels = [];
+    const channels = normalizeChannels(config);
+    const imageModel = normalizeDefaultModel(config.imageModel || config.model, channels, "image");
+    return {
+        ...config,
+        channelMode: "local",
+        apiFormat: normalizeApiFormat(config.apiFormat),
+        channels,
+        models: modelOptionsFromChannels(channels),
+        model: imageModel,
+        imageModel,
+        videoModel: normalizeDefaultModel(config.videoModel, channels, "video"),
+        textModel: normalizeDefaultModel(config.textModel || config.model, channels, "text"),
+        audioModel: normalizeDefaultModel(config.audioModel || defaultConfig.audioModel, channels, "audio"),
+        audioVoice: config.audioVoice || defaultConfig.audioVoice,
+        audioFormat: config.audioFormat || defaultConfig.audioFormat,
+        audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
+        audioInstructions: config.audioInstructions || "",
+        reasoningEffort: config.reasoningEffort || "auto",
+        videoSeconds: config.videoSeconds || "6",
+        vquality: config.vquality || "720",
+        videoGenerateAudio: config.videoGenerateAudio || "true",
+        videoWatermark: config.videoWatermark || "false",
+        canvasImageCount: config.canvasImageCount || "3",
+    };
+}
+
+export function normalizeWebdavSyncConfig(config?: Partial<WebdavSyncConfig>): WebdavSyncConfig {
+    return {
+        url: typeof config?.url === "string" ? config.url : defaultWebdavSyncConfig.url,
+        username: typeof config?.username === "string" ? config.username : defaultWebdavSyncConfig.username,
+        password: typeof config?.password === "string" ? config.password : defaultWebdavSyncConfig.password,
+        directory: typeof config?.directory === "string" ? config.directory : defaultWebdavSyncConfig.directory,
+        lastSyncedAt: typeof config?.lastSyncedAt === "string" ? config.lastSyncedAt : defaultWebdavSyncConfig.lastSyncedAt,
+    };
+}
 
 export function useEffectiveConfig() {
     const config = useConfigStore((state) => state.config);
@@ -395,14 +419,19 @@ function normalizeChannels(config: AiConfig) {
     return channels;
 }
 
+function normalizeDefaultModel(value: string | undefined, channels: ModelChannel[], capability: ModelCapability) {
+    const options = channels.flatMap((channel) => channel.models.filter((model) => model.capability === capability).map((model) => encodeChannelModel(channel.id, model.name)));
+    const normalized = normalizeModelOptionValue(value, channels);
+    return options.includes(normalized) ? normalized : options[0] || "";
+}
+
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return GEMINI_BASE_URL;
-    if (apiFormat === "ark") return ARK_BASE_URL;
     return OPENAI_BASE_URL;
 }
 
 function normalizeApiFormat(apiFormat: unknown): ApiCallFormat {
-    return apiFormat === "gemini" || apiFormat === "ark" ? apiFormat : "openai";
+    return apiFormat === "gemini" ? apiFormat : "openai";
 }
 
 function uniqueModelOptions(models: string[]) {
@@ -410,27 +439,8 @@ function uniqueModelOptions(models: string[]) {
 }
 
 export function buildApiUrl(baseUrl: string, path: string) {
-    let normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
-    normalizedBaseUrl = normalizeArkPlanBaseUrl(normalizedBaseUrl);
+    const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/api/v3") || lowerBaseUrl.endsWith("/api/plan/v3") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
+    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
     return `${apiBaseUrl}${path}`;
-}
-
-function normalizeArkPlanBaseUrl(baseUrl: string) {
-    try {
-        const url = new URL(baseUrl);
-        const path = url.pathname.replace(/\/+$/, "");
-        const lowerPath = path.toLowerCase();
-        const arkPlanIndex = lowerPath.indexOf("/api/plan/v3");
-        if (arkPlanIndex < 0) return baseUrl;
-        const end = arkPlanIndex + "/api/plan/v3".length;
-        if (lowerPath.length !== end && lowerPath[end] !== "/") return baseUrl;
-        url.pathname = path.slice(0, end);
-        url.search = "";
-        url.hash = "";
-        return url.toString().replace(/\/+$/, "");
-    } catch {
-        return baseUrl;
-    }
 }

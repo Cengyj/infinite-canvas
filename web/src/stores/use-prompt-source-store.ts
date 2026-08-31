@@ -8,12 +8,25 @@ export type PromptSourceSchedule = {
     lastFetchedAt: string;
 };
 
+export type PromptSourceState = {
+    sources: PromptSource[];
+    schedule: PromptSourceSchedule;
+};
+
 const PROMPT_SOURCE_STORE_KEY = "infinite-canvas:prompt_source_store_v2";
 
 const defaultSchedule: PromptSourceSchedule = {
     intervalMinutes: 30,
     lastFetchedAt: "",
 };
+
+export function normalizePromptSourceState(persistedState?: Partial<PromptSourceState>): PromptSourceState {
+    const savedSources = Array.isArray(persistedState?.sources) ? persistedState.sources : [];
+    const enabledById = new Map(savedSources.map((source) => [source.id, source.enabled]));
+    const builtIn = DEFAULT_PROMPT_SOURCES.map((source) => ({ ...source, enabled: enabledById.get(source.id) ?? source.enabled }));
+    const custom = savedSources.filter((source) => !source.builtIn).map((source) => createPromptSource(source));
+    return { sources: [...builtIn, ...custom], schedule: { ...defaultSchedule, ...(persistedState?.schedule || {}) } };
+}
 
 export const PROMPT_SOURCE_INTERVALS = [0, 30, 60, 360, 1440];
 
@@ -48,11 +61,7 @@ export const usePromptSourceStore = create<PromptSourceStore>()(
             partialize: (state) => ({ sources: state.sources, schedule: state.schedule }),
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<PromptSourceStore>;
-                const savedSources = Array.isArray(persistedState.sources) ? persistedState.sources : [];
-                const enabledById = new Map(savedSources.map((source) => [source.id, source.enabled]));
-                const builtIn = DEFAULT_PROMPT_SOURCES.map((source) => ({ ...source, enabled: enabledById.get(source.id) ?? source.enabled }));
-                const custom = savedSources.filter((source) => !source.builtIn).map((source) => createPromptSource(source));
-                return { ...current, sources: [...builtIn, ...custom], schedule: { ...defaultSchedule, ...(persistedState.schedule || {}) } };
+                return { ...current, ...normalizePromptSourceState(persistedState) };
             },
         },
     ),

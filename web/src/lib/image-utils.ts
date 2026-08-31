@@ -51,11 +51,6 @@ export function readImageMeta(dataUrl: string) {
     });
 }
 
-export function imageExtension(source: string, mimeType?: string) {
-    const format = mimeType?.match(/^image[/]([^;]+)/i)?.[1] || source.match(/^data:image[/]([^;]+)/i)?.[1] || source.match(/image[/]([^;]+)/i)?.[1] || "png";
-    return format.toLowerCase();
-}
-
 export function dataUrlToFile(image: ReferenceImage) {
     const [header, content] = image.dataUrl.split(",", 2);
     const mimeType = header.match(/data:(.*?);base64/)?.[1] || image.type || "image/png";

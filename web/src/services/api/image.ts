@@ -116,16 +116,22 @@ const IMAGE_MAX_EDGE = 3840;
 const IMAGE_MAX_RATIO = 3;
 const IMAGE_OUTPUT_FORMAT = "png";
 
-const GEMINI_SUPPORTED_RATIOS = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
-const GEMINI_IMAGE_SIZE_BY_QUALITY: Record<string, string> = { low: "1K", medium: "2K", high: "4K", standard: "1K", hd: "2K" };
-const GROK_IMAGINE_IMAGE_MODEL = "grok-imagine-image";
-const GROK_IMAGINE_ASPECT_RATIOS = new Set(["1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "9:19.5", "19.5:9", "9:20", "20:9", "1:2", "2:1", "auto"]);
-const GROK_IMAGINE_RESOLUTION_BY_QUALITY: Record<string, "1k" | "2k"> = { low: "1k", standard: "1k", medium: "2k", hd: "2k" };
-const GROK_IMAGINE_SIZE_PRESETS: Record<string, { aspectRatio: string; resolution: "1k" | "2k" }> = {
-    "2048x2048": { aspectRatio: "1:1", resolution: "2k" },
-    "2048x1152": { aspectRatio: "16:9", resolution: "2k" },
-    "1152x2048": { aspectRatio: "9:16", resolution: "2k" },
+const GEMINI_STANDARD_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
+const GEMINI_EXTENDED_RATIOS = [...GEMINI_STANDARD_RATIOS, "1:4", "1:8", "4:1", "8:1"] as const;
+type GeminiAspectRatio = typeof GEMINI_EXTENDED_RATIOS[number];
+type GeminiImageSize = "512" | "1K" | "2K" | "4K";
+type GeminiImageConfig = { aspectRatio?: GeminiAspectRatio; imageSize?: GeminiImageSize };
+type GeminiImageGenerationConfig = { responseModalities: ["TEXT", "IMAGE"]; imageConfig?: GeminiImageConfig };
+type GeminiImageModelProfile = { aspectRatios: readonly GeminiAspectRatio[]; imageSizes?: readonly GeminiImageSize[]; allowsExtendedRatios?: boolean };
+
+const GEMINI_DEFAULT_IMAGE_PROFILE: GeminiImageModelProfile = { aspectRatios: GEMINI_STANDARD_RATIOS };
+const GEMINI_IMAGE_MODEL_PROFILES: Record<string, GeminiImageModelProfile> = {
+    "gemini-3.1-flash-image": { aspectRatios: GEMINI_EXTENDED_RATIOS, imageSizes: ["512", "1K", "2K", "4K"], allowsExtendedRatios: true },
+    "gemini-3.1-flash-lite-image": { aspectRatios: GEMINI_EXTENDED_RATIOS, imageSizes: ["1K"], allowsExtendedRatios: true },
+    "gemini-3-pro-image": { aspectRatios: GEMINI_STANDARD_RATIOS, imageSizes: ["1K", "2K", "4K"] },
+    "gemini-2.5-flash-image": { aspectRatios: GEMINI_STANDARD_RATIOS },
 };
+const GEMINI_IMAGE_SIZE_BY_QUALITY: Record<string, GeminiImageSize> = { low: "1K", medium: "2K", high: "4K", standard: "1K", hd: "2K" };
 
 function normalizeQuality(quality: string) {
     const value = quality.trim().toLowerCase();
@@ -205,44 +211,36 @@ function resolveRequestSize(quality: string | undefined, size: string) {
     throw new Error(apiText("invalidImageSizeFormat"));
 }
 
-function isGrokImagineImage(config: Pick<AiConfig, "apiFormat" | "model">) {
-    return config.apiFormat === "openai" && config.model === GROK_IMAGINE_IMAGE_MODEL;
-}
-
-function resolveGrokImagineImageConfig(config: AiConfig) {
-    const size = config.size.trim().toLowerCase();
-    const quality = normalizeQuality(config.quality);
-    const qualityResolution = quality ? GROK_IMAGINE_RESOLUTION_BY_QUALITY[quality] : undefined;
-    const preset = GROK_IMAGINE_SIZE_PRESETS[size];
-    if (normalizeBackground(config.background) || quality === "high" || (preset && qualityResolution && preset.resolution !== qualityResolution)) {
-        throw new Error(apiText("grokImagineConfigUnsupported"));
-    }
-    if (preset) return { aspect_ratio: preset.aspectRatio, resolution: preset.resolution };
-    if (size && !GROK_IMAGINE_ASPECT_RATIOS.has(size)) throw new Error(apiText("grokImagineConfigUnsupported"));
-    return { ...(size ? { aspect_ratio: size } : {}), ...(qualityResolution ? { resolution: qualityResolution } : {}) };
-}
-
-function resolveGeminiImageConfig(config: AiConfig) {
+function resolveGeminiImageGenerationConfig(config: AiConfig): GeminiImageGenerationConfig {
+    const profile = resolveGeminiImageModelProfile(config.model);
     const value = config.size.trim();
     const dimensions = parseImageDimensions(value);
     const ratio = dimensions ? `${dimensions.width}:${dimensions.height}` : value;
-    const aspectRatio = value && value.toLowerCase() !== "auto" ? closestGeminiAspectRatio(ratio) : undefined;
-    const imageSize = supportsGeminiImageSize(config.model) ? resolveGeminiImageSize(config.quality, dimensions) : undefined;
-    const image = { ...(aspectRatio ? { aspectRatio } : {}), ...(imageSize ? { imageSize } : {}) };
-    return Object.keys(image).length ? { imageConfig: image } : {};
+    const aspectRatio = value && value.toLowerCase() !== "auto" ? closestGeminiAspectRatio(ratio, profile) : undefined;
+    const imageSize = profile.imageSizes ? resolveGeminiImageSize(config.quality, dimensions) : undefined;
+    if (imageSize && profile.imageSizes && !profile.imageSizes.includes(imageSize)) {
+        throw new Error(apiText("geminiImageSizeUnsupported", { model: geminiModelName(config.model), size: imageSize, supported: profile.imageSizes.join(", ") }));
+    }
+    const imageConfig: GeminiImageConfig = { ...(aspectRatio ? { aspectRatio } : {}), ...(imageSize ? { imageSize } : {}) };
+    return { responseModalities: ["TEXT", "IMAGE"], ...(Object.keys(imageConfig).length ? { imageConfig } : {}) };
 }
 
-function closestGeminiAspectRatio(value: string) {
-    const ratio = parseImageRatio(value);
+function resolveGeminiImageModelProfile(model: string) {
+    const modelName = geminiModelName(model).toLowerCase().replace(/-preview$/, "");
+    return GEMINI_IMAGE_MODEL_PROFILES[modelName] || GEMINI_DEFAULT_IMAGE_PROFILE;
+}
+
+function closestGeminiAspectRatio(value: string, profile: GeminiImageModelProfile): GeminiAspectRatio {
+    const ratio = profile.allowsExtendedRatios ? parseRatioValue(value) : parseImageRatio(value);
     const target = ratio.width / ratio.height;
-    return GEMINI_SUPPORTED_RATIOS.reduce((best, item) => {
+    return profile.aspectRatios.reduce((best, item) => {
         const current = parseRatioValue(item);
         const bestRatio = parseRatioValue(best);
         return Math.abs(current.width / current.height - target) < Math.abs(bestRatio.width / bestRatio.height - target) ? item : best;
     });
 }
 
-function resolveGeminiImageSize(quality: string, dimensions: { width: number; height: number } | null) {
+function resolveGeminiImageSize(quality: string, dimensions: { width: number; height: number } | null): GeminiImageSize | undefined {
     const normalizedQuality = normalizeQuality(quality);
     if (normalizedQuality) return GEMINI_IMAGE_SIZE_BY_QUALITY[normalizedQuality];
     if (!dimensions) return undefined;
@@ -253,15 +251,9 @@ function resolveGeminiImageSize(quality: string, dimensions: { width: number; he
     return "4K";
 }
 
-function supportsGeminiImageSize(model: string) {
-    const value = model.toLowerCase();
-    return value.includes("gemini-3") || value.includes("3.1") || value.includes("3-pro");
-}
-
-function resolveImageDataUrl(item: Record<string, unknown>, useResponseMimeType = false) {
+function resolveImageDataUrl(item: Record<string, unknown>) {
     if (typeof item.b64_json === "string" && item.b64_json) {
-        const mimeType = useResponseMimeType && typeof item.mime_type === "string" && item.mime_type ? item.mime_type : "image/png";
-        return `data:${mimeType};base64,${item.b64_json}`;
+        return `data:image/png;base64,${item.b64_json}`;
     }
     if (typeof item.url === "string" && item.url) {
         return item.url;
@@ -269,7 +261,7 @@ function resolveImageDataUrl(item: Record<string, unknown>, useResponseMimeType 
     return null;
 }
 
-function parseImagePayload(payload: ImageApiResponse, useResponseMimeType = false) {
+function parseImagePayload(payload: ImageApiResponse) {
     if (typeof payload.code === "number" && payload.code !== 0) {
         throw new Error(payload.msg || apiText("requestFailed"));
     }
@@ -280,7 +272,7 @@ function parseImagePayload(payload: ImageApiResponse, useResponseMimeType = fals
         || [];
     const images =
         imageList
-            .map((item) => resolveImageDataUrl(item, useResponseMimeType))
+            .map(resolveImageDataUrl)
             .filter((value): value is string => Boolean(value))
             .map((dataUrl) => ({ id: nanoid(), dataUrl }));
 
@@ -330,6 +322,7 @@ function readApiErrorMessage(value: unknown): string {
 function readAxiosError(error: unknown, fallback: string) {
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError(error)) {
+        if (!error.response && error.code === "ERR_NETWORK") return apiText("corsRequired");
         const responseData = error.response?.data;
         // Prefer the API error from the response body.
         const apiMsg = readApiErrorMessage(responseData);
@@ -715,7 +708,7 @@ async function requestGeminiImagesOnce(config: AiConfig, prompt: string, referen
     const response = await axios.post<GeminiPayload>(
         geminiApiUrl(config, "generateContent"),
         {
-            ...toGeminiBody(config, [{ role: "user", content: prompt }], { generationConfig: { responseModalities: ["TEXT", "IMAGE"], ...resolveGeminiImageConfig(config) } }),
+            ...toGeminiBody(config, [{ role: "user", content: prompt }], { generationConfig: resolveGeminiImageGenerationConfig(config) }),
             contents: [{ role: "user", parts }],
         },
         { headers: geminiHeaders(config), signal: options?.signal },
@@ -769,31 +762,28 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
-    const grokImagineConfig = isGrokImagineImage(requestConfig) ? resolveGrokImagineImageConfig(config) : null;
-    const quality = grokImagineConfig ? undefined : normalizeQuality(config.quality);
-    const requestSize = grokImagineConfig ? undefined : resolveRequestSize(quality, config.size);
-    const background = grokImagineConfig ? undefined : normalizeBackground(config.background);
+    const quality = normalizeQuality(config.quality);
+    const requestSize = resolveRequestSize(quality, config.size);
+    const background = normalizeBackground(config.background);
     try {
         const response = await axios.post<ImageApiResponse>(
             aiApiUrl(requestConfig, "/images/generations"),
-            grokImagineConfig
-                ? { model: requestConfig.model, prompt: withSystemPrompt(requestConfig, prompt), n: Math.min(n, 10), ...grokImagineConfig, response_format: "b64_json" }
-                : {
-                      model: requestConfig.model,
-                      prompt: withSystemPrompt(requestConfig, prompt),
-                      n,
-                      ...(quality ? { quality } : {}),
-                      ...(requestSize ? { size: requestSize } : {}),
-                      ...(background ? { background } : {}),
-                      response_format: "b64_json",
-                      output_format: IMAGE_OUTPUT_FORMAT,
-                  },
+            {
+                model: requestConfig.model,
+                prompt: withSystemPrompt(requestConfig, prompt),
+                n,
+                ...(quality ? { quality } : {}),
+                ...(requestSize ? { size: requestSize } : {}),
+                ...(background ? { background } : {}),
+                response_format: "b64_json",
+                output_format: IMAGE_OUTPUT_FORMAT,
+            },
             {
                 headers: aiHeaders(requestConfig, "application/json"),
                 signal: options?.signal,
             },
         );
-        const images = parseImagePayload(response.data, Boolean(grokImagineConfig));
+        const images = parseImagePayload(response.data);
         return images;
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
@@ -829,37 +819,6 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         if (mask) throw new Error(apiText("geminiMaskUnsupported"));
         try {
             return await requestGeminiImages(requestConfig, requestPrompt, references, n, options);
-        } catch (error) {
-            throw new Error(readAxiosError(error, apiText("requestFailed")));
-        }
-    }
-
-    if (requestConfig.apiFormat === "ark") {
-        if (mask) throw new Error(apiText("maskModelUnsupported"));
-        const quality = normalizeQuality(config.quality);
-        const requestSize = resolveRequestSize(quality, config.size);
-        const background = normalizeBackground(config.background);
-        const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
-        try {
-            const response = await axios.post<ImageApiResponse>(
-                aiApiUrl(requestConfig, "/images/generations"),
-                {
-                    model: requestConfig.model,
-                    prompt: withSystemPrompt(requestConfig, requestPrompt),
-                    n,
-                    response_format: "b64_json",
-                    output_format: IMAGE_OUTPUT_FORMAT,
-                    image: refs,
-                    ...(quality ? { quality } : {}),
-                    ...(requestSize ? { size: requestSize } : {}),
-                    ...(background ? { background } : {}),
-                },
-                {
-                    headers: aiHeaders(requestConfig, "application/json"),
-                    signal: options?.signal,
-                },
-            );
-            return parseImagePayload(response.data);
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
