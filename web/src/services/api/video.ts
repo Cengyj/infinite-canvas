@@ -2,7 +2,9 @@ import axios from "axios";
 import { nanoid } from "nanoid";
 
 import i18n from "@/i18n";
+import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { dataUrlToFile } from "@/lib/image-utils";
+import { normalizeVideoRatio, normalizeVideoSeconds } from "@/lib/video-config";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, type AiConfig } from "@/stores/use-config-store";
@@ -18,6 +20,7 @@ const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiE
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
 export type VideoGenerationTask = { id: string; provider: "openai" | "plugin"; model: string };
 export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
+export const MAX_VIDEO_REFERENCE_IMAGES = 7;
 
 /** Results for scripted (plugin) video models, which run their own create+poll in one shot at task creation. */
 const pluginVideoResults = new Map<string, VideoGenerationResult>();
@@ -47,17 +50,20 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
 }
 
 export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], options?: RequestOptions): Promise<VideoGenerationTask> {
+    if (references.length > MAX_VIDEO_REFERENCE_IMAGES) throw new Error(apiText("videoReferenceLimit", { count: MAX_VIDEO_REFERENCE_IMAGES }));
     const selectedModel = (config.model || config.videoModel).trim();
     const requestConfig = resolveModelRequestConfig(config, selectedModel);
     const script = resolveModelScript(config, selectedModel);
-    if (script) return createPluginVideoTask(requestConfig, selectedModel, script, prompt, references, options);
+    const requestPrompt = buildImageReferencePromptText(prompt, references);
+    if (script) return createPluginVideoTask(requestConfig, selectedModel, script, requestPrompt, references, options);
     assertVideoConfig(requestConfig, requestConfig.model);
-    return createOpenAIVideoTask(requestConfig, selectedModel, prompt, references, options);
+    return createOpenAIVideoTask(requestConfig, selectedModel, requestPrompt, references, options);
 }
 
 export async function pollVideoGenerationTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
     if (task.provider === "plugin") {
         const result = pluginVideoResults.get(task.id);
+        if (result) pluginVideoResults.delete(task.id);
         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
     }
     const requestConfig = resolveModelRequestConfig(config, task.model);
@@ -68,28 +74,32 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
 async function createPluginVideoTask(config: AiConfig, model: string, script: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
     if (!config.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
     if (!config.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
-    const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
-    const result = videoPluginResult(
-        await runModelPlugin({
-            capability: "video",
-            script,
-            config,
-            prompt,
-            images: refs,
-            params: {
-                seconds: normalizeVideoSeconds(config.videoSeconds),
-                size: normalizeVideoSize(config.size),
-                resolution: normalizeVideoResolution(config.vquality),
-                ratio: config.size,
-                generateAudio: boolConfig(config.videoGenerateAudio, true),
-                watermark: boolConfig(config.videoWatermark, false),
-            },
-            signal: options?.signal,
-        }),
-    );
-    const id = nanoid();
-    pluginVideoResults.set(id, result);
-    return { id, provider: "plugin", model };
+    const refs = await Promise.all(references.map((image) => imageToDataUrl(image, options?.signal)));
+    try {
+        const result = videoPluginResult(
+            await runModelPlugin({
+                capability: "video",
+                script,
+                config,
+                prompt,
+                images: refs,
+                params: {
+                    seconds: normalizeVideoSeconds(config.videoSeconds),
+                    size: normalizeVideoSize(config.size),
+                    resolution: normalizeVideoResolution(config.vquality),
+                    ratio: normalizeVideoRatio(config.size),
+                    generateAudio: boolConfig(config.videoGenerateAudio, true),
+                    watermark: boolConfig(config.videoWatermark, false),
+                },
+                signal: options?.signal,
+            }),
+        );
+        const id = nanoid();
+        pluginVideoResults.set(id, result);
+        return { id, provider: "plugin", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("videoGenerationFailed")));
+    }
 }
 
 function videoPluginResult(result: unknown): VideoGenerationResult {
@@ -124,7 +134,7 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     if (normalizeVideoSize(config.size)) body.append("size", normalizeVideoSize(config.size)!);
     body.append("resolution_name", normalizeVideoResolution(config.vquality));
     body.append("preset", "normal");
-    const files = await Promise.all(references.slice(0, 7).map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
+    const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image, options?.signal) })));
     files.forEach((file) => body.append("input_reference[]", file));
     try {
         const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config), signal: options?.signal })).data);
@@ -168,11 +178,6 @@ function assertVideoConfig(config: AiConfig, model: string) {
     if (!config.baseUrl.trim()) throw new Error(apiText("baseUrlRequired"));
     if (!config.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
     if (config.apiFormat === "gemini") throw new Error(apiText("geminiVideoUnsupported"));
-}
-
-function normalizeVideoSeconds(value: string) {
-    const seconds = Math.floor(Number(value) || 6);
-    return String(Math.max(1, Math.min(20, seconds)));
 }
 
 function normalizeVideoSize(value: string) {
@@ -275,14 +280,20 @@ function delay(ms: number, signal?: AbortSignal) {
             reject(new DOMException("Aborted", "AbortError"));
             return;
         }
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-        );
+        let settled = false;
+        const cleanup = () => signal?.removeEventListener("abort", onAbort);
+        const settle = (callback: () => void) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback();
+        };
+        const onAbort = () => {
+            clearTimeout(timer);
+            settle(() => reject(new DOMException("Aborted", "AbortError")));
+        };
+        const timer = setTimeout(() => settle(resolve), ms);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
     });
 }

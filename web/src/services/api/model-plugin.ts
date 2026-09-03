@@ -39,7 +39,14 @@ function pluginHeaders(extra?: Record<string, string>, hasJsonBody = false): Rec
 
 function pluginUrl(config: AiConfig, path: string) {
     if (/^https?:/i.test(path)) return path;
-    return buildApiUrl(config.baseUrl, path.startsWith("/") ? path : `/${path}`);
+    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+    // Respect an explicitly versioned path so custom scripts can call Gemini's
+    // /v1beta endpoints without ending up with /v1/v1beta.
+    if (/^\/v1(?:beta)?(?:\/|$)/i.test(normalizedPath)) {
+        const baseUrl = config.baseUrl.trim().replace(/\/+$/, "").replace(/\/v1(?:beta)?$/i, "");
+        return `${baseUrl}${normalizedPath}`;
+    }
+    return buildApiUrl(config.baseUrl, normalizedPath);
 }
 
 function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHttp {
@@ -77,15 +84,21 @@ function sleep(ms: number, signal?: AbortSignal) {
             reject(new DOMException("Aborted", "AbortError"));
             return;
         }
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-        );
+        let settled = false;
+        const cleanup = () => signal?.removeEventListener("abort", onAbort);
+        const settle = (callback: () => void) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback();
+        };
+        const onAbort = () => {
+            clearTimeout(timer);
+            settle(() => reject(new DOMException("Aborted", "AbortError")));
+        };
+        const timer = setTimeout(() => settle(resolve), ms);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
     });
 }
 
@@ -155,6 +168,7 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
     } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") throw error;
         if (axios.isCancel(error)) throw error;
+        if (axios.isAxiosError(error)) throw error;
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(i18n.t("modelPlugin.executionFailed", { message }));
     }
@@ -166,7 +180,7 @@ export type PluginVariable = { name: string; type: string; desc: string; capabil
 export function getPluginVariables(): PluginVariable[] {
     return [
         { name: "prompt", type: "string", desc: i18n.t("modelPlugin.variables.prompt"), capabilities: ["image", "video", "audio"] },
-        { name: "images", type: "string[]", desc: i18n.t("modelPlugin.variables.images"), capabilities: ["image", "video"] },
+        { name: "images", type: "string[]", desc: i18n.t("modelPlugin.variables.images"), capabilities: ["image", "video", "text"] },
         { name: "messages", type: "{ role, content }[]", desc: i18n.t("modelPlugin.variables.messages"), capabilities: ["text"] },
         { name: "params", type: "object", desc: i18n.t("modelPlugin.variables.params") },
         { name: "model", type: "string", desc: i18n.t("modelPlugin.variables.model") },
@@ -196,118 +210,184 @@ export function getPluginTemplates(): Record<ModelCapability, PluginTemplate[]> 
             label: i18n.t("modelPlugin.templates.openai"),
             script: `// ${i18n.t("modelPlugin.templates.imageOpenai")}
 // ${i18n.t("modelPlugin.templates.availableImage")}
+const readImages = (data) => {
+  const apiError = typeof data?.error === "string" ? data.error : data?.error?.message;
+  if (apiError) throw new Error(apiError);
+  const items = Array.isArray(data?.data) ? data.data : [];
+  const output = items.map((item) => item.b64_json ? \`data:image/png;base64,\${item.b64_json}\` : item.url).filter(Boolean);
+  if (!output.length) throw new Error(${JSON.stringify(i18n.t("modelPlugin.noImages"))});
+  return output;
+};
+const count = Math.max(1, Math.min(10, Math.floor(Number(params.count) || 1)));
 if (images.length === 0) {
   // ${i18n.t("modelPlugin.templates.textToImage")}
-  const data = await request({
-    method: "post",
-    url: \`\${baseUrl}/v1/images/generations\`,
-    headers: { "Content-Type": "application/json", Authorization: \`Bearer \${apiKey}\` },
-    data: { model, prompt, n: params.count, size: params.size, response_format: "b64_json" },
+  const data = await http.post("/images/generations", {
+    model, prompt, n: count,
+    ...(params.size ? { size: params.size } : {}),
+    ...(params.quality ? { quality: params.quality } : {}),
+    ...(params.background ? { background: params.background } : {}),
   });
-  return (data.data || []).map((item) => item.b64_json ? \`data:image/png;base64,\${item.b64_json}\` : item.url);
+  return readImages(data);
 }
 
 // ${i18n.t("modelPlugin.templates.imageToImage")}
+if (images.length > 16) throw new Error(${JSON.stringify(i18n.t("imageWorkbench.editReferenceLimit", { count: 16 }))});
 const form = new FormData();
 form.set("model", model);
 form.set("prompt", prompt);
-form.set("n", String(params.count));
-form.set("response_format", "b64_json");
+form.set("n", String(count));
+if (params.size) form.set("size", params.size);
+if (params.quality) form.set("quality", params.quality);
+if (params.background) form.set("background", params.background);
+const imageField = images.length > 1 ? "image[]" : "image";
 for (const dataUrl of images) {
-  form.append("image", await (await fetch(dataUrl)).blob(), "ref.png");
+  const response = await fetch(dataUrl, { signal });
+  if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
+  form.append(imageField, await response.blob(), "ref.png");
 }
-const edited = await request({
-  method: "post",
-  url: \`\${baseUrl}/v1/images/edits\`,
-  headers: { Authorization: \`Bearer \${apiKey}\` }, // ${i18n.t("modelPlugin.templates.formDataHeader")}
-  data: form,
-});
-return (edited.data || []).map((item) => item.b64_json ? \`data:image/png;base64,\${item.b64_json}\` : item.url);`,
+const edited = await http.post("/images/edits", form); // ${i18n.t("modelPlugin.templates.formDataHeader")}
+return readImages(edited);`,
         },
         {
             label: i18n.t("modelPlugin.templates.gemini"),
             script: `// ${i18n.t("modelPlugin.templates.imageGemini")}
 // ${i18n.t("modelPlugin.templates.availableImageGemini")}
+const apiBase = baseUrl.trim().replace(/\\/+$/, "").replace(/\\/v1(?:beta)?$/i, "");
+const modelName = encodeURIComponent(String(model).trim().replace(/^models\\//i, ""));
 const parts = [{ text: prompt }];
 for (const dataUrl of images) {
   const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
-  if (match) parts.push({ inline_data: { mime_type: match[1], data: match[2] } });
+  if (!match) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
+  parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
 }
 const data = await request({
   method: "post",
-  url: \`\${baseUrl}/v1beta/models/\${model}:generateContent\`,
+  url: \`\${apiBase}/v1beta/models/\${modelName}:generateContent\`,
   headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-  data: { contents: [{ role: "user", parts }], generationConfig: { responseModalities: ["IMAGE"] } },
+  data: { contents: [{ role: "user", parts }], generationConfig: { responseModalities: ["TEXT", "IMAGE"] } },
 });
-return (data.candidates || [])
+const apiError = typeof data.error === "string" ? data.error : data.error?.message;
+if (apiError) throw new Error(apiError);
+if (data.promptFeedback?.blockReason) throw new Error(${JSON.stringify(i18n.t("apiErrors.geminiRejected", { reason: "__REASON__" }))}.replace("__REASON__", data.promptFeedback.blockReason));
+const finishReason = (data.candidates || []).map((candidate) => candidate.finishReason).find((reason) => reason && reason !== "STOP");
+if (finishReason) throw new Error(${JSON.stringify(i18n.t("apiErrors.geminiRejected", { reason: "__REASON__" }))}.replace("__REASON__", finishReason));
+const output = (data.candidates || [])
   .flatMap((c) => c.content?.parts || [])
   .map((p) => p.inlineData || p.inline_data)
-  .filter(Boolean)
-  .map((img) => \`data:\${img.mimeType || img.mime_type || "image/png"};base64,\${img.data}\`);`,
+  .filter((img) => Boolean(img?.data))
+  .map((img) => \`data:\${img.mimeType || img.mime_type || "image/png"};base64,\${img.data}\`);
+if (!output.length) throw new Error(${JSON.stringify(i18n.t("modelPlugin.noImages"))});
+return output;`,
         },
     ],
     video: [
         {
             label: i18n.t("modelPlugin.templates.openai"),
             script: `// ${i18n.t("modelPlugin.templates.videoOpenai")}
-const headers = { "Content-Type": "application/json", Authorization: \`Bearer \${apiKey}\` };
-const task = await request({
-  method: "post",
-  url: \`\${baseUrl}/v1/videos\`,
-  headers,
-  data: { model, prompt, seconds: params.seconds },
+if (images.length > 1) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSingleReference"))});
+const seconds = String(params.seconds || "").trim();
+if (!["4", "8", "12"].includes(seconds)) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSecondsUnsupported"))});
+const size = String(params.size || "").trim();
+if (size && !["720x1280", "1280x720", "1024x1792", "1792x1024"].includes(size)) {
+  throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSizeUnsupported"))});
+}
+const task = await http.post("/videos", {
+  model, prompt, seconds,
+  ...(size ? { size } : {}),
+  ...(images[0] ? { input_reference: { image_url: images[0] } } : {}),
 });
-return await poll(
-  () => request({ method: "get", url: \`\${baseUrl}/v1/videos/\${task.id}\`, headers }),
-  (state) => state.status === "completed" ? { url: state.video_url || state.url } : null,
+if (!task?.id) throw new Error(${JSON.stringify(i18n.t("apiErrors.noVideoTaskId"))});
+const taskId = encodeURIComponent(String(task.id));
+const completed = await poll(
+  () => http.get(\`/videos/\${taskId}\`),
+  (state) => {
+    if (state.status === "failed" || state.status === "cancelled") {
+      const error = typeof state.error === "string" ? state.error : state.error?.message;
+      throw new Error(error || state.message || ${JSON.stringify(i18n.t("apiErrors.videoGenerationFailed"))});
+    }
+    return state.status === "completed" ? state : null;
+  },
   { intervalMs: 2500, timeoutMs: 300000 },
-);`,
+);
+const url = completed.video_url || completed.url;
+return url ? { url } : await http.get(\`/videos/\${taskId}/content\`, { responseType: "blob" });`,
         },
         {
             label: i18n.t("modelPlugin.templates.gemini"),
             script: `// ${i18n.t("modelPlugin.templates.videoGemini")}
 // ${i18n.t("modelPlugin.templates.availableVideoGemini")}
+if (images.length > 1) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.videoSingleReference"))});
+const apiBase = baseUrl.trim().replace(/\\/+$/, "").replace(/\\/v1(?:beta)?$/i, "");
+const rawModelName = String(model).trim().replace(/^models\\//i, "");
+const modelName = encodeURIComponent(rawModelName);
 const headers = { "Content-Type": "application/json", "x-goog-api-key": apiKey };
 const instance = { prompt };
 const first = images[0] && images[0].match(/^data:([^;]+);base64,(.*)$/);
 if (first) instance.image = { bytesBase64Encoded: first[2], mimeType: first[1] };
+if (images.length && !first) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
+const size = String(params.size || params.ratio || "").trim().toLowerCase();
+const dimensions = size.match(/^(\\d+)\\s*[x:]\\s*(\\d+)$/);
+if (dimensions && Number(dimensions[1]) === Number(dimensions[2])) {
+  throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.geminiVideoSquareUnsupported"))});
+}
+const aspectRatio = !size || size === "auto" || size === "adaptive" || !dimensions
+  ? ""
+  : Number(dimensions[1]) > Number(dimensions[2]) ? "16:9" : "9:16";
+const isVeo2 = /^veo-2(?:[.-]|$)/i.test(rawModelName);
+const seconds = String(params.seconds || "").trim();
+const allowedSeconds = isVeo2 ? ["5", "6", "8"] : ["4", "6", "8"];
+if (!allowedSeconds.includes(seconds)) {
+  throw new Error(isVeo2
+    ? ${JSON.stringify(i18n.t("modelPlugin.templates.geminiVeo2SecondsUnsupported"))}
+    : ${JSON.stringify(i18n.t("modelPlugin.templates.geminiVeo3SecondsUnsupported"))});
+}
+const resolution = String(params.resolution || "720p").trim().toLowerCase();
+if (!isVeo2 && resolution !== "720p") {
+  throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.geminiVeo3ResolutionUnsupported"))});
+}
+const parameters = {
+  durationSeconds: seconds,
+  ...(aspectRatio ? { aspectRatio } : {}),
+  ...(!isVeo2 ? { resolution: "720p" } : {}),
+};
 const op = await request({
   method: "post",
-  url: \`\${baseUrl}/v1beta/models/\${model}:predictLongRunning\`,
+  url: \`\${apiBase}/v1beta/models/\${modelName}:predictLongRunning\`,
   headers,
-  data: { instances: [instance], parameters: { aspectRatio: params.ratio } },
+  data: { instances: [instance], parameters },
 });
-return await poll(
-  () => request({ method: "get", url: \`\${baseUrl}/v1beta/\${op.name}\`, headers }),
+if (!op?.name) throw new Error(${JSON.stringify(i18n.t("apiErrors.noVideoTask"))});
+const uri = await poll(
+  () => request({ method: "get", url: \`\${apiBase}/v1beta/\${String(op.name).replace(/^\\/+/, "")}\`, headers }),
   (state) => {
     if (!state.done) return null;
+    if (state.error) throw new Error(state.error.message || ${JSON.stringify(i18n.t("apiErrors.videoGenerationFailed"))});
     const uri = state.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri;
     if (!uri) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.geminiNoVideoUri"))});
-    return { url: uri.includes("key=") ? uri : \`\${uri}\${uri.includes("?") ? "&" : "?"}key=\${apiKey}\` };
+    return uri;
   },
   { intervalMs: 5000, timeoutMs: 300000 },
-);`,
+);
+return await request({ method: "get", url: uri, headers: { "x-goog-api-key": apiKey }, responseType: "blob" });`,
         },
     ],
     audio: [
         {
             label: i18n.t("modelPlugin.templates.openai"),
             script: `// ${i18n.t("modelPlugin.templates.audioOpenai")}
-return await request({
-  method: "post",
-  url: \`\${baseUrl}/v1/audio/speech\`,
-  headers: { "Content-Type": "application/json", Authorization: \`Bearer \${apiKey}\` },
-  responseType: "blob",
-  data: { model, input: prompt, voice: params.voice, response_format: params.format, speed: Number(params.speed) },
-});`,
+return await http.post("/audio/speech", {
+  model, input: prompt, voice: params.voice, response_format: params.format, speed: Number(params.speed),
+}, { responseType: "blob" });`,
         },
         {
             label: i18n.t("modelPlugin.templates.gemini"),
             script: `// ${i18n.t("modelPlugin.templates.audioGemini")}
 // ${i18n.t("modelPlugin.templates.availableAudioGemini")}
+const apiBase = baseUrl.trim().replace(/\\/+$/, "").replace(/\\/v1(?:beta)?$/i, "");
+const modelName = encodeURIComponent(String(model).trim().replace(/^models\\//i, ""));
 const data = await request({
   method: "post",
-  url: \`\${baseUrl}/v1beta/models/\${model}:generateContent\`,
+  url: \`\${apiBase}/v1beta/models/\${modelName}:generateContent\`,
   headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
   data: {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -326,19 +406,30 @@ return { data: audio.data };`,
         {
             label: i18n.t("modelPlugin.templates.openai"),
             script: `// ${i18n.t("modelPlugin.templates.textOpenai")}
-const data = await request({
-  method: "post",
-  url: \`\${baseUrl}/v1/responses\`,
-  headers: { "Content-Type": "application/json", Authorization: \`Bearer \${apiKey}\` },
-  data: {
-    model,
-    input: messages,
-    ...(reasoningEffort === "auto" ? {} : { reasoning: { effort: reasoningEffort } }),
-  },
+const input = messages.map((message) => ({
+  ...message,
+  content: Array.isArray(message.content)
+    ? message.content.map((part) => part.type === "image_url"
+      ? { type: "input_image", image_url: part.image_url.url }
+      : { type: "input_text", text: part.text })
+    : message.content,
+}));
+const data = await http.post("/responses", {
+  model,
+  input,
+  store: false,
+  ...(reasoningEffort === "auto" ? {} : { reasoning: { effort: reasoningEffort } }),
 });
+const apiError = typeof data.error === "string" ? data.error : data.error?.message;
+if (apiError) throw new Error(apiError);
+const incompleteMessage = (reason) => ${JSON.stringify(i18n.t("apiErrors.textResponseIncomplete", { reason: "__REASON__" }))}.replace("__REASON__", String(reason));
+if (data.status !== "completed") throw new Error(incompleteMessage(data.incomplete_details?.reason || data.status || "missing_status"));
+const content = (data.output || []).flatMap((item) => item.content || []);
+const refusal = content.find((item) => item.refusal)?.refusal;
+if (refusal) throw new Error(refusal);
 const text = data.output_text
-  || (data.output || []).flatMap((o) => o.content || []).map((c) => c.text || "").join("")
-  || "";
+  || content.map((item) => item.text || "").join("");
+if (!text?.trim()) throw new Error(${JSON.stringify(i18n.t("apiErrors.noContent"))});
 onDelta(text);
 return text;`,
         },
@@ -346,16 +437,38 @@ return text;`,
             label: i18n.t("modelPlugin.templates.gemini"),
             script: `// ${i18n.t("modelPlugin.templates.textGemini")}
 // ${i18n.t("modelPlugin.templates.availableTextGemini")}
+const toParts = (content) => (Array.isArray(content) ? content : [{ type: "text", text: content }]).map((part) => {
+  if (part.type !== "image_url") return { text: part.text || "" };
+  const match = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
+  return match ? { inlineData: { mimeType: match[1], data: match[2] } } : { fileData: { fileUri: part.image_url.url } };
+});
 const contents = messages
   .filter((m) => m.role !== "system")
-  .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+  .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: toParts(m.content) }));
+const systemText = messages.filter((m) => m.role === "system").map((m) => m.content).join("\\n\\n") || systemPrompt;
+const apiBase = baseUrl.trim().replace(/\\/+$/, "").replace(/\\/v1(?:beta)?$/i, "");
+const modelName = encodeURIComponent(String(model).trim().replace(/^models\\//i, ""));
 const data = await request({
   method: "post",
-  url: \`\${baseUrl}/v1beta/models/\${model}:generateContent\`,
+  url: \`\${apiBase}/v1beta/models/\${modelName}:generateContent\`,
   headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-  data: { contents, ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}) },
+  data: { contents, ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}) },
 });
-const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+const apiError = typeof data.error === "string" ? data.error : data.error?.message;
+if (apiError) throw new Error(apiError);
+const rejectedMessage = (reason) => ${JSON.stringify(i18n.t("apiErrors.geminiRejected", { reason: "__REASON__" }))}.replace("__REASON__", String(reason));
+if (data.promptFeedback?.blockReason) throw new Error(rejectedMessage(data.promptFeedback.blockReason));
+const candidate = data.candidates?.[0];
+const finishReason = candidate?.finishReason;
+if (finishReason !== "STOP") {
+  const reason = finishReason || "missing_finish_reason";
+  if (reason === "MAX_TOKENS" || !finishReason) {
+    throw new Error(${JSON.stringify(i18n.t("apiErrors.textResponseIncomplete", { reason: "__REASON__" }))}.replace("__REASON__", reason));
+  }
+  throw new Error(rejectedMessage(reason));
+}
+const text = candidate.content?.parts?.map((part) => part.text || "").join("") || "";
+if (!text.trim()) throw new Error(${JSON.stringify(i18n.t("apiErrors.noContent"))});
 onDelta(text);
 return text;`,
         },

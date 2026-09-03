@@ -9,7 +9,7 @@ import { requestEdit, requestGeneration, requestImageQuestion } from "@/services
 import { requestAudioGeneration, storeGeneratedAudio } from "@/services/api/audio";
 import { requestVideoGeneration, storeGeneratedVideo } from "@/services/api/video";
 import { defaultConfig, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { uploadImage } from "@/services/image-storage";
+import { collectImageStorageKeys, registerActiveImageStorageKeys, uploadImage } from "@/services/image-storage";
 import { uploadMediaFile } from "@/services/file-storage";
 import { nanoid } from "nanoid";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
@@ -18,6 +18,7 @@ import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl, splitDataUrl, upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "@/lib/canvas/canvas-node-size";
+import { canvasPromptOptimizationChanges, type CanvasPromptOptimizationBinding } from "@/lib/canvas/canvas-prompt-optimization";
 import { App, Button, Modal } from "antd";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "@/constant/canvas";
 import { ActiveConnectionPath, ConnectionPath } from "@/components/canvas/canvas-connections";
@@ -250,6 +251,7 @@ function InfiniteCanvasPage() {
     const selectionBoxRef = useRef(selectionBox);
     const pendingConnectionCreateRef = useRef(pendingConnectionCreate);
     const generationRequestsRef = useRef(new Map<string, CanvasGenerationRequest>());
+    const promptOptimizationBindingsRef = useRef(new Map<string, CanvasPromptOptimizationBinding>());
 
     const createHistoryEntry = useCallback(
         (): CanvasHistoryEntry => ({
@@ -319,6 +321,7 @@ function InfiniteCanvasPage() {
     useEffect(() => {
         if (!hydrated) return;
         setProjectLoaded(false);
+        promptOptimizationBindingsRef.current.clear();
         const project = openProject(projectId);
         if (!project) {
             navigate("/canvas", { replace: true });
@@ -392,6 +395,14 @@ function InfiniteCanvasPage() {
             }
         };
     }, [activeChatId, backgroundMode, chatSessions, connections, createHistoryEntry, nodes, projectLoaded, showImageInfo]);
+
+    useEffect(() => {
+        if (!projectLoaded) return;
+        return registerActiveImageStorageKeys(
+            `canvas-project:${projectId}`,
+            collectImageStorageKeys({ history: historyRef.current, lastHistory: lastHistoryRef.current }),
+        );
+    }, [historyState, projectId, projectLoaded]);
 
     useEffect(() => {
         if (!projectLoaded || historyPausedRef.current) return;
@@ -697,6 +708,7 @@ function InfiniteCanvasPage() {
     const deleteNodes = useCallback(
         (ids: Set<string>) => {
             if (!ids.size) return;
+            ids.forEach((id) => promptOptimizationBindingsRef.current.delete(id));
             const allIds = new Set(ids);
             setNodes((prev) => {
                 const next = prev.filter((node) => !allIds.has(node.id));
@@ -743,6 +755,7 @@ function InfiniteCanvasPage() {
     }, [cancelPendingConnectionCreate]);
 
     const clearCanvas = useCallback(() => {
+        promptOptimizationBindingsRef.current.clear();
         setNodes([]);
         setConnections([]);
         setInfoNodeId(null);
@@ -1516,11 +1529,24 @@ function InfiniteCanvasPage() {
     }, []);
 
     const handleNodePromptChange = useCallback((nodeId: string, prompt: string) => {
+        promptOptimizationBindingsRef.current.delete(nodeId);
         setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, prompt } } : node)));
     }, []);
 
-    const handleConfigNodeChange = useCallback((nodeId: string, patch: Partial<CanvasNodeData["metadata"]>) => {
+    const handleConfigNodeChange = useCallback((nodeId: string, patch: Partial<CanvasNodeMetadata>) => {
+        if ("prompt" in patch || "composerContent" in patch) promptOptimizationBindingsRef.current.delete(nodeId);
         setNodes((prev) => prev.map((node) => (node.id === nodeId ? applyNodeConfigPatch(node, patch) : node)));
+    }, []);
+
+    const getPromptOptimizationReferences = useCallback((nodeId: string, mode: "image" | "video") => {
+        const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
+        if (!sourceNode || (mode === "image" ? sourceNode.type !== CanvasNodeType.Image : sourceNode.type !== CanvasNodeType.Video)) return [];
+        if (mode === "image" && sourceNode.metadata?.content) return sourceNodeReferenceImages(sourceNode);
+        return buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, "").referenceImages;
+    }, []);
+
+    const handlePromptOptimizationApplied = useCallback((nodeId: string, binding: CanvasPromptOptimizationBinding) => {
+        promptOptimizationBindingsRef.current.set(nodeId, binding);
     }, []);
 
     const downloadNodeImage = useCallback((node: CanvasNodeData) => {
@@ -2000,6 +2026,23 @@ function InfiniteCanvasPage() {
         async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => {
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
+            const optimizationBinding = promptOptimizationBindingsRef.current.get(nodeId);
+            if (optimizationBinding) {
+                if ((mode === "image" && sourceNode?.type === CanvasNodeType.Image) || (mode === "video" && sourceNode?.type === CanvasNodeType.Video)) {
+                    const references = getPromptOptimizationReferences(nodeId, mode);
+                    const changes = canvasPromptOptimizationChanges(optimizationBinding, prompt, mode, generationConfig, references);
+                    if (!changes) promptOptimizationBindingsRef.current.delete(nodeId);
+                    else if (changes.referencesChanged || changes.contextChanged) {
+                        promptOptimizationBindingsRef.current.delete(nodeId);
+                        const namespace = mode === "image" ? "imageWorkbench" : "videoWorkbench";
+                        const messageKey = changes.referencesChanged && changes.contextChanged ? "referenceAndContextChanged" : changes.referencesChanged ? "referenceChanged" : "contextChanged";
+                        message.warning(t(`${namespace}.promptOptimization.${messageKey}`));
+                        return;
+                    }
+                } else {
+                    promptOptimizationBindingsRef.current.delete(nodeId);
+                }
+            }
             if (!isAiConfigReady(generationConfig, generationConfig.model)) {
                 openConfigDialog(true);
                 return;
@@ -2388,7 +2431,7 @@ function InfiniteCanvasPage() {
                 setRunningNodeId(null);
             }
         },
-        [effectiveConfig, finishGenerationRequest, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
+        [effectiveConfig, finishGenerationRequest, getPromptOptimizationReferences, isAiConfigReady, message, openConfigDialog, startGenerationRequest, t],
     );
     useEffect(() => {
         generateNodeRef.current = handleGenerateNode;
@@ -2705,6 +2748,8 @@ function InfiniteCanvasPage() {
                     node={panelNode}
                     isRunning={runningNodeId === panelNode.id}
                     mentionReferences={mentionReferencesByNodeId.get(panelNode.id) || EMPTY_REFERENCES}
+                    getOptimizationReferences={getPromptOptimizationReferences}
+                    onOptimizationApplied={handlePromptOptimizationApplied}
                     onPromptChange={handleNodePromptChange}
                     onConfigChange={handleConfigNodeChange}
                     onGenerate={handleGenerateNode}
@@ -2716,7 +2761,7 @@ function InfiniteCanvasPage() {
                     }}
                 />
             ),
-        [configInputsById, confirmStopGeneration, handleConfigNodeChange, handleGenerateNode, handleNodePromptChange, mentionReferencesByNodeId, renderPluginPanel, runningNodeId],
+        [configInputsById, confirmStopGeneration, getPromptOptimizationReferences, handleConfigNodeChange, handleGenerateNode, handleNodePromptChange, handlePromptOptimizationApplied, mentionReferencesByNodeId, renderPluginPanel, runningNodeId],
     );
 
     const renderNodeContentPanel = useCallback(

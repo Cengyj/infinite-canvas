@@ -2,7 +2,7 @@ import localforage from "localforage";
 
 import i18n from "@/i18n";
 import { getMediaBlob, resolveMediaUrl, setMediaBlob } from "@/services/file-storage";
-import { getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
+import { createImageStorageLease, getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
 import { downloadWebdavFile, uploadWebdavFile, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import type { Asset } from "@/stores/use-asset-store";
 import { useAssetStore } from "@/stores/use-asset-store";
@@ -145,10 +145,15 @@ async function syncDomain<T>(config: WebdavSyncConfig, onProgress: AppSyncProgre
         const mergedData = remoteManifest ? options.mergeData(localData, remoteManifest.data) : localData;
 
         if (remoteManifest) {
-            emitProgress(onProgress, { domain: options.key, label: options.label, stage: "下载缺失媒体", status: "active" });
-            await downloadMissingFiles(config, options.key, mergedData, remoteManifest.files, onProgress);
-            emitProgress(onProgress, { domain: options.key, label: options.label, stage: "写入本地合并结果", status: "active" });
-            await options.applyData?.(mergedData);
+            const lease = createImageStorageLease(collectStorageKeys(mergedData).filter((key) => key.startsWith("image:")));
+            try {
+                emitProgress(onProgress, { domain: options.key, label: options.label, stage: "下载缺失媒体", status: "active" });
+                await downloadMissingFiles(config, options.key, mergedData, remoteManifest.files, onProgress);
+                emitProgress(onProgress, { domain: options.key, label: options.label, stage: "写入本地合并结果", status: "active" });
+                await options.applyData?.(mergedData);
+            } finally {
+                lease.release();
+            }
         }
 
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: "上传新增媒体", status: "active" });
@@ -212,7 +217,7 @@ async function downloadMissingFiles<T>(config: WebdavSyncConfig, domain: DomainK
     await runWithConcurrency(tasks, FILE_CONCURRENCY, async (remoteFile) => {
         const blob = await downloadWebdavFile(config, remoteFile.path);
         if (!blob) return;
-        const typedBlob = blob.type ? blob : blob.slice(0, blob.size, remoteFile.mimeType);
+        const typedBlob = remoteFile.mimeType && blob.type !== remoteFile.mimeType ? blob.slice(0, blob.size, remoteFile.mimeType) : blob;
         await (remoteFile.storageKey.startsWith("image:") ? setImageBlob(remoteFile.storageKey, typedBlob) : setMediaBlob(remoteFile.storageKey, typedBlob));
         downloaded += 1;
         emitProgress(onProgress, { domain, label: domainLabel(domain), stage: "下载媒体", current: downloaded, total: tasks.length, status: "active" });

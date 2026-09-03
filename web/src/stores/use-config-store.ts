@@ -83,7 +83,7 @@ export const defaultConfig: AiConfig = {
             models: [
                 { name: "gpt-image-2", capability: "image" },
                 { name: "grok-imagine-video", capability: "video" },
-                { name: "gpt-5.5", capability: "text" },
+                { name: "gpt-5.6-sol", capability: "text" },
                 { name: "gpt-4o-mini-tts", capability: "audio" },
             ],
         },
@@ -103,7 +103,7 @@ export const defaultConfig: AiConfig = {
     model: "default::gpt-image-2",
     imageModel: "default::gpt-image-2",
     videoModel: "default::grok-imagine-video",
-    textModel: "default::gpt-5.5",
+    textModel: "default::gpt-5.6-sol",
     audioModel: "default::gpt-4o-mini-tts",
     audioVoice: "alloy",
     audioFormat: "mp3",
@@ -118,7 +118,7 @@ export const defaultConfig: AiConfig = {
     models: [
         "default::gpt-image-2",
         "default::grok-imagine-video",
-        "default::gpt-5.5",
+        "default::gpt-5.6-sol",
         "default::gpt-4o-mini-tts",
         "google::gemini-2.5-flash-image-preview",
         "google::gemini-3-pro-image-preview",
@@ -265,9 +265,10 @@ export const useConfigStore = create<ConfigStore>()(
 );
 
 export function normalizeAiConfig(persistedConfig?: Partial<AiConfig>): AiConfig {
+    const restoreLegacyChannel = Boolean(persistedConfig && !Array.isArray(persistedConfig.channels));
     const config = { ...defaultConfig, ...persistedConfig };
-    if (persistedConfig && !Array.isArray(persistedConfig.channels)) config.channels = [];
-    const channels = normalizeChannels(config);
+    if (restoreLegacyChannel) config.channels = [];
+    const channels = normalizeChannels(config, restoreLegacyChannel);
     const imageModel = normalizeDefaultModel(config.imageModel || config.model, channels, "image");
     return {
         ...config,
@@ -394,7 +395,7 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
     };
 }
 
-function normalizeChannels(config: AiConfig) {
+function normalizeChannels(config: AiConfig, restoreLegacyChannel: boolean) {
     const persistedChannels = Array.isArray(config.channels) ? config.channels : [];
     const channels = persistedChannels.map((channel, index) =>
         createModelChannel({
@@ -404,7 +405,7 @@ function normalizeChannels(config: AiConfig) {
             models: normalizeChannelModels(channel.models),
         }),
     );
-    if (!channels.length) {
+    if (!channels.length && restoreLegacyChannel) {
         channels.push(
             createModelChannel({
                 id: "default",
@@ -441,6 +442,6 @@ function uniqueModelOptions(models: string[]) {
 export function buildApiUrl(baseUrl: string, path: string) {
     const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
     const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
+    const apiBaseUrl = /\/v1(?:beta)?$/i.test(lowerBaseUrl) ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
     return `${apiBaseUrl}${path}`;
 }

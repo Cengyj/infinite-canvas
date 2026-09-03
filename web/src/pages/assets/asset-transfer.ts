@@ -2,7 +2,7 @@ import { saveAs } from "file-saver";
 
 import { createZip, readZip } from "@/lib/zip";
 import { getMediaBlob, setMediaBlob } from "@/services/file-storage";
-import { getImageBlob, setImageBlob } from "@/services/image-storage";
+import { createImageStorageLease, getImageBlob, setImageBlob } from "@/services/image-storage";
 import type { Asset } from "@/stores/use-asset-store";
 
 type AssetExportFile = {
@@ -47,15 +47,21 @@ export async function readAssetPackage(file: File) {
     const assetFile = zip.get("assets.json");
     if (!assetFile) throw new Error("missing assets.json");
     const data = JSON.parse(await assetFile.text()) as AssetExportFile;
-    await Promise.all(
-        data.files.map(async (item) => {
-            const blob = zip.get(item.path);
-            if (!blob) return;
-            const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
-            await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
-        }),
-    );
-    return data.assets;
+    const lease = createImageStorageLease(data.files.flatMap((item) => (item.storageKey.startsWith("image:") ? [item.storageKey] : [])));
+    try {
+        await Promise.all(
+            data.files.map(async (item) => {
+                const blob = zip.get(item.path);
+                if (!blob) return;
+                const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
+                await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
+            }),
+        );
+        return { assets: data.assets, release: lease.release };
+    } catch (error) {
+        lease.release();
+        throw error;
+    }
 }
 
 function safeFileName(value: string) {

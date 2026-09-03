@@ -7,7 +7,15 @@ export function useCopyText() {
     const { t } = useTranslation();
 
     return (value: string, successText = t("common.copied")) => {
-        copy(value);
-        message.success(successText);
+        try {
+            if (copy(value)) {
+                message.success(successText);
+                return true;
+            }
+        } catch {
+            // Fall through to the shared failure message.
+        }
+        message.error(t("common.copyFailed"));
+        return false;
     };
 }

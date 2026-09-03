@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
 
 import { nanoid } from "nanoid";
-import { localForageStorage } from "@/lib/localforage-storage";
+import { isLocalForageStorageReadReliable, localForageStorage } from "@/lib/localforage-storage";
 import { cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
 
@@ -27,6 +27,7 @@ type AssetBase<T extends AssetKind> = {
 
 type AssetStore = {
     hydrated: boolean;
+    storageReady: boolean;
     assets: Asset[];
     addAsset: (asset: Omit<Asset, "id" | "createdAt" | "updatedAt">) => string;
     updateAsset: (id: string, patch: Partial<Omit<Asset, "id" | "createdAt">>) => void;
@@ -67,6 +68,7 @@ export const useAssetStore = create<AssetStore>()(
     persist(
         (set, get) => ({
             hydrated: false,
+            storageReady: false,
             assets: [],
             addAsset: (asset) => {
                 const now = new Date().toISOString();
@@ -75,9 +77,11 @@ export const useAssetStore = create<AssetStore>()(
                 return id;
             },
             updateAsset: (id, patch) =>
-                set((state) => ({
-                    assets: state.assets.map((asset) => (asset.id === id ? ({ ...asset, ...patch, updatedAt: new Date().toISOString() } as Asset) : asset)),
-                })),
+                set((state) => {
+                    const assets = state.assets.map((asset) => (asset.id === id ? ({ ...asset, ...patch, updatedAt: new Date().toISOString() } as Asset) : asset));
+                    get().cleanupImages({ assets });
+                    return { assets };
+                }),
             removeAsset: (id) =>
                 set((state) => {
                     const assets = state.assets.filter((asset) => asset.id !== id);
@@ -86,10 +90,14 @@ export const useAssetStore = create<AssetStore>()(
                 }),
             replaceAssets: (assets) => set({ assets }),
             cleanupImages: (extra) => {
-                window.setTimeout(async () => {
-                    const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
-                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                    await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                window.setTimeout(() => {
+                    void import("@/stores/canvas/use-canvas-store")
+                        .then(async ({ useCanvasStore }) => {
+                            if (!get().storageReady || !useCanvasStore.getState().storageReady) return;
+                            const usedData = () => ({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                            if (await cleanupUnusedImages(usedData)) await cleanupUnusedMedia(usedData);
+                        })
+                        .catch(() => undefined);
                 }, 0);
             },
         }),
@@ -97,8 +105,8 @@ export const useAssetStore = create<AssetStore>()(
             name: ASSET_STORE_KEY,
             storage: assetStorage,
             partialize: (state) => ({ assets: state.assets }) as StorageValue<AssetStore>["state"],
-            onRehydrateStorage: () => () => {
-                useAssetStore.setState({ hydrated: true });
+            onRehydrateStorage: () => (_state, error) => {
+                useAssetStore.setState({ hydrated: true, storageReady: !error && isLocalForageStorageReadReliable(ASSET_STORE_KEY) });
             },
         },
     ),

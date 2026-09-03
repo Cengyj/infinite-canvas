@@ -6,7 +6,7 @@ import { useTranslation } from "react-i18next";
 
 import { useCopyText } from "@/hooks/use-copy-text";
 import { formatBytes, readFileAsDataUrl } from "@/lib/image-utils";
-import { uploadImage } from "@/services/image-storage";
+import { createImageStorageLease, deleteStoredImages, uploadImage, type ImageStorageLease } from "@/services/image-storage";
 import { cn } from "@/lib/utils";
 import { useAssetStore, type Asset, type AssetKind, type ImageAsset } from "@/stores/use-asset-store";
 import { exportAssets, readAssetPackage } from "./asset-transfer";
@@ -33,6 +33,10 @@ export default function AssetsPage() {
     const coverInputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const assetInputRef = useRef<HTMLInputElement>(null);
+    const imageDraftRef = useRef<ImageDraft>(null);
+    const imageDraftEpochRef = useRef(0);
+    const imageDraftLeaseRef = useRef<ImageStorageLease | null>(null);
+    const ownedImageDraftKeyRef = useRef("");
     const assets = useAssetStore((state) => state.assets);
     const addAsset = useAssetStore((state) => state.addAsset);
     const updateAsset = useAssetStore((state) => state.updateAsset);
@@ -72,18 +76,46 @@ export default function AssetsPage() {
         setPage((value) => Math.min(value, maxPage));
     }, [filteredAssets.length, pageSize]);
 
+    useEffect(
+        () => () => {
+            imageDraftEpochRef.current += 1;
+            const storageKey = ownedImageDraftKeyRef.current;
+            ownedImageDraftKeyRef.current = "";
+            if (storageKey) void deleteStoredImages([storageKey]).catch(() => undefined);
+            imageDraftLeaseRef.current?.release();
+            imageDraftLeaseRef.current = null;
+        },
+        [],
+    );
+
+    const updateImageDraft = (draft: ImageDraft) => {
+        imageDraftRef.current = draft;
+        setImageDraft(draft);
+    };
+
+    const disposeUploadedImageDraft = (removeFile = true) => {
+        imageDraftEpochRef.current += 1;
+        const storageKey = ownedImageDraftKeyRef.current;
+        ownedImageDraftKeyRef.current = "";
+        if (removeFile && storageKey) void deleteStoredImages([storageKey]).catch(() => undefined);
+        imageDraftLeaseRef.current?.release();
+        imageDraftLeaseRef.current = null;
+    };
+
     const openCreate = () => {
+        disposeUploadedImageDraft();
         setEditingAsset(null);
-        setImageDraft(null);
+        updateImageDraft(null);
         setFormKind("text");
         form.setFieldsValue({ kind: "text", title: "", coverUrl: "", tags: [], source: t("assets.manual"), note: "", content: "" });
         setIsAssetOpen(true);
     };
 
     const openEdit = (asset: Asset) => {
+        disposeUploadedImageDraft();
         setEditingAsset(asset);
         setFormKind(asset.kind);
-        setImageDraft(asset.kind === "image" ? asset.data : null);
+        updateImageDraft(asset.kind === "image" ? asset.data : null);
         form.setFieldsValue({
             kind: asset.kind,
             title: asset.title,
@@ -98,9 +130,10 @@ export default function AssetsPage() {
 
     const saveAsset = async () => {
         const values = await form.validateFields();
+        const savedCoverUrl = values.coverUrl?.trim() || (values.kind === "image" && imageDraft ? imageDraft.dataUrl : "");
         const base = {
             title: values.title.trim(),
-            coverUrl: values.coverUrl?.trim() || (values.kind === "image" && imageDraft ? imageDraft.dataUrl : ""),
+            coverUrl: values.kind === "text" && savedCoverUrl.startsWith("blob:") ? "" : savedCoverUrl,
             tags: values.tags || [],
             source: values.source?.trim(),
             note: values.note?.trim(),
@@ -119,6 +152,7 @@ export default function AssetsPage() {
             editingAsset ? updateAsset(editingAsset.id, asset) : addAsset(asset);
         }
 
+        disposeUploadedImageDraft(values.kind !== "image");
         message.success(editingAsset ? t("assets.updated") : t("assets.saved"));
         setIsAssetOpen(false);
     };
@@ -131,11 +165,31 @@ export default function AssetsPage() {
 
     const readImageFile = async (file?: File) => {
         if (!file || !file.type.startsWith("image/")) return;
-        const image = await uploadImage(file);
-        const draft = { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType };
-        setImageDraft(draft);
-        if (!form.getFieldValue("coverUrl")) form.setFieldValue("coverUrl", draft.dataUrl);
-        if (!form.getFieldValue("title")) form.setFieldValue("title", file.name);
+        const epoch = ++imageDraftEpochRef.current;
+        const lease = createImageStorageLease();
+        try {
+            const image = await uploadImage(file, lease);
+            if (imageDraftEpochRef.current !== epoch) {
+                await deleteStoredImages([image.storageKey]).catch(() => undefined);
+                return;
+            }
+            const previousDraft = imageDraftRef.current;
+            const previousStorageKey = ownedImageDraftKeyRef.current;
+            const previousLease = imageDraftLeaseRef.current;
+            const draft = { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType };
+            ownedImageDraftKeyRef.current = image.storageKey;
+            imageDraftLeaseRef.current = lease;
+            updateImageDraft(draft);
+            const coverUrl = form.getFieldValue("coverUrl");
+            if (!coverUrl || coverUrl === previousDraft?.dataUrl) form.setFieldValue("coverUrl", draft.dataUrl);
+            if (!form.getFieldValue("title")) form.setFieldValue("title", file.name);
+            if (previousStorageKey) await deleteStoredImages([previousStorageKey]).catch(() => undefined);
+            previousLease?.release();
+        } catch (error) {
+            if (imageDraftEpochRef.current === epoch) message.error(error instanceof Error ? error.message : t("common.imageReadFailed"));
+        } finally {
+            if (imageDraftLeaseRef.current !== lease) lease.release();
+        }
     };
 
     const copyAssetText = async (asset: Asset) => {
@@ -159,15 +213,19 @@ export default function AssetsPage() {
     const importAssetZip = async (file?: File) => {
         if (!file) return;
         try {
-            const importedAssets = await readAssetPackage(file);
-            importedAssets.forEach((asset) => {
-                const payload = { ...asset } as Record<string, unknown>;
-                delete payload.id;
-                delete payload.createdAt;
-                delete payload.updatedAt;
-                addAsset(payload as Parameters<typeof addAsset>[0]);
-            });
-            message.success(t("assets.imported", { count: importedAssets.length }));
+            const imported = await readAssetPackage(file);
+            try {
+                imported.assets.forEach((asset) => {
+                    const payload = { ...asset } as Record<string, unknown>;
+                    delete payload.id;
+                    delete payload.createdAt;
+                    delete payload.updatedAt;
+                    addAsset(payload as Parameters<typeof addAsset>[0]);
+                });
+                message.success(t("assets.imported", { count: imported.assets.length }));
+            } finally {
+                imported.release();
+            }
         } catch {
             message.error(t("assets.importFailed"));
         } finally {
@@ -282,7 +340,20 @@ export default function AssetsPage() {
                 </div>
             </main>
 
-            <Modal title={editingAsset ? t("assets.edit") : t("assets.add")} open={isAssetOpen} width={980} onCancel={() => setIsAssetOpen(false)} onOk={() => void saveAsset()} okText={t("common.save")} cancelText={t("common.cancel")} destroyOnHidden>
+            <Modal
+                title={editingAsset ? t("assets.edit") : t("assets.add")}
+                open={isAssetOpen}
+                width={980}
+                onCancel={() => {
+                    disposeUploadedImageDraft();
+                    updateImageDraft(null);
+                    setIsAssetOpen(false);
+                }}
+                onOk={() => void saveAsset()}
+                okText={t("common.save")}
+                cancelText={t("common.cancel")}
+                destroyOnHidden
+            >
                 <div className="grid gap-6 pt-1 lg:grid-cols-[minmax(0,1fr)_320px]">
                     <Form form={form} layout="vertical" requiredMark={false} initialValues={{ kind: "text", tags: [] }}>
                         <Form.Item name="kind" label={t("assets.type")}>

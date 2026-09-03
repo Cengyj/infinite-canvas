@@ -335,6 +335,7 @@ export function AppConfigModal() {
     const setConfigDialogOpen = useConfigStore((state) => state.setConfigDialogOpen);
     return (
         <Modal
+            zIndex={1150}
             title={
                 <div>
                     <div className="text-lg font-semibold">{t("config.title")}</div>

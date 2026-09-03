@@ -4,6 +4,7 @@ import { nanoid } from "nanoid";
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
+const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
 const objectUrls = new Map<string, string>();
 
 export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
@@ -21,6 +22,8 @@ export async function resolveMediaUrl(storageKey?: string, fallback = "") {
     const cached = objectUrls.get(storageKey);
     if (cached) return cached;
     const blob = await store.getItem<Blob>(storageKey);
+    const resolved = objectUrls.get(storageKey);
+    if (resolved) return resolved;
     if (!blob) return fallback;
     const url = URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
@@ -34,6 +37,8 @@ export async function getMediaBlob(storageKey: string) {
 export async function setMediaBlob(storageKey: string, blob: Blob) {
     await store.setItem(storageKey, blob);
     const url = URL.createObjectURL(blob);
+    const previousUrl = objectUrls.get(storageKey);
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
     objectUrls.set(storageKey, url);
     return url;
 }
@@ -49,16 +54,25 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
     );
 }
 
-export async function cleanupUnusedMedia(usedData: unknown) {
-    const usedKeys = collectMediaStorageKeys(usedData);
+export async function cleanupUnusedMedia(usedData: unknown | (() => unknown)) {
+    const readUsedData = () => (typeof usedData === "function" ? usedData() : usedData);
+    const usedKeys = collectMediaStorageKeys(readUsedData());
+    await videoLogStore.iterate((value) => {
+        collectMediaStorageKeys(value, usedKeys);
+    });
     const unused: string[] = [];
     await store.iterate((_value, key) => {
         if (!usedKeys.has(key)) unused.push(key);
     });
-    await Promise.all(unused.map((key) => store.removeItem(key)));
+    collectMediaStorageKeys(readUsedData(), usedKeys);
+    await deleteStoredMedia(unused.filter((key) => !usedKeys.has(key)));
 }
 
 export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()) {
+    if (typeof value === "string") {
+        if (value.startsWith("video:") || value.startsWith("audio:") || value.startsWith("file:")) keys.add(value);
+        return keys;
+    }
     if (!value || typeof value !== "object") return keys;
     if ("storageKey" in value && typeof value.storageKey === "string" && value.storageKey.includes(":")) keys.add(value.storageKey);
     Object.values(value).forEach((item) => (Array.isArray(item) ? item.forEach((child) => collectMediaStorageKeys(child, keys)) : collectMediaStorageKeys(item, keys)));

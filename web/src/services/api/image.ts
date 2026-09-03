@@ -58,21 +58,23 @@ type ResponseApiToolDefinition = {
     strict?: boolean;
 };
 type ResponseApiOutputItem =
-    | { type?: "message"; content?: Array<{ type?: string; text?: string }> }
+    | { type?: "message"; content?: Array<{ type?: string; text?: string; refusal?: string }> }
     | { type?: "function_call"; id?: string; call_id?: string; name?: string; arguments?: string };
 type ResponseApiPayload = {
     id?: string;
+    status?: string;
+    incomplete_details?: { reason?: string };
     output?: ResponseApiOutputItem[];
     output_text?: string;
-    error?: { message?: string };
+    error?: unknown;
     code?: number;
     msg?: string;
 };
-type ResponseStreamState = { buffer: string; text: string; payload?: ResponseApiPayload; error?: string };
+type ResponseStreamState = { buffer: string; text: string; refusal?: string; payload?: ResponseApiPayload; error?: string; terminal?: "completed" | "incomplete" | "failed" | "cancelled" };
 
 type ImageApiResponse = {
     data?: Array<Record<string, unknown>>;
-    error?: { message?: string };
+    error?: unknown;
     code?: number;
     msg?: string;
 };
@@ -90,11 +92,11 @@ type GeminiContent = { role?: "user" | "model"; parts: GeminiPart[] };
 type GeminiPayload = {
     candidates?: Array<{ content?: { parts?: GeminiPart[] }; finishReason?: string }>;
     models?: Array<{ name?: string }>;
-    error?: { message?: string };
+    error?: unknown;
     promptFeedback?: { blockReason?: string };
 };
-type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string };
-type RequestOptions = { signal?: AbortSignal };
+type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseToolCall[]; error?: string; finished: boolean };
+type RequestOptions = { signal?: AbortSignal; store?: boolean };
 
 const QUALITY_BASE: Record<string, number> = {
     low: 1024,
@@ -114,7 +116,7 @@ const IMAGE_MIN_PIXELS = 655360;
 const IMAGE_MAX_PIXELS = 8294400;
 const IMAGE_MAX_EDGE = 3840;
 const IMAGE_MAX_RATIO = 3;
-const IMAGE_OUTPUT_FORMAT = "png";
+const MAX_OPENAI_EDIT_REFERENCES = 16;
 
 const GEMINI_STANDARD_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
 const GEMINI_EXTENDED_RATIOS = [...GEMINI_STANDARD_RATIOS, "1:4", "1:8", "4:1", "8:1"] as const;
@@ -262,6 +264,8 @@ function resolveImageDataUrl(item: Record<string, unknown>) {
 }
 
 function parseImagePayload(payload: ImageApiResponse) {
+    const error = readApiErrorMessage(payload.error);
+    if (error) throw new Error(error);
     if (typeof payload.code === "number" && payload.code !== 0) {
         throw new Error(payload.msg || apiText("requestFailed"));
     }
@@ -295,7 +299,7 @@ function readApiErrorMessage(value: unknown): string {
             const parsed = JSON.parse(value);
             const inner = readApiErrorMessage(parsed) || value;
             // Treat an empty parsed object such as "{}" as having no useful message.
-            if (inner === value && typeof parsed === "object" && Object.keys(parsed).length === 0) return "";
+            if (inner === value && isRecord(parsed) && Object.keys(parsed).length === 0) return "";
             return inner;
         } catch {
             // Detect HTML error pages.
@@ -305,15 +309,10 @@ function readApiErrorMessage(value: unknown): string {
     }
     if (typeof value !== "object") return "";
     const payload = value as { msg?: unknown; message?: unknown; error?: unknown; detail?: unknown };
-    // error may be a string or an object containing a message.
-    const errorMsg =
-        typeof payload.error === "string"
-            ? payload.error
-            : (payload.error as { message?: unknown })?.message;
     return (
         readApiErrorMessage(payload.msg) ||
         readApiErrorMessage(payload.message) ||
-        readApiErrorMessage(errorMsg) ||
+        readApiErrorMessage(payload.error) ||
         readApiErrorMessage(payload.detail) ||
         ""
     );
@@ -334,6 +333,7 @@ function readAxiosError(error: unknown, fallback: string) {
         return error.message || fallback;
     }
     if (error instanceof DOMException && error.name === "AbortError") return apiText("requestCanceled");
+    if (error instanceof TypeError && /fetch|network|load failed/i.test(error.message)) return apiText("corsRequired");
     return error instanceof Error ? readApiErrorMessage(error.message) || error.message : fallback;
 }
 
@@ -390,6 +390,13 @@ function withSystemMessage<T extends ResponseInputMessage>(config: AiConfig, mes
     return systemPrompt ? [{ role: "system" as const, content: systemPrompt }, ...messages] : messages;
 }
 
+function messageImageUrls(messages: ResponseInputMessage[]) {
+    return messages.flatMap((message) => {
+        if ("type" in message || message.role === "tool" || !Array.isArray(message.content)) return [];
+        return message.content.flatMap((item) => (item.type === "image_url" ? [item.image_url.url] : []));
+    });
+}
+
 function toResponseInput(messages: ResponseInputMessage[]): ResponseInputItem[] {
     return messages.flatMap((message): ResponseInputItem[] => {
         if ("type" in message) return [message];
@@ -415,6 +422,8 @@ function toResponseTool(tool: ResponseFunctionTool): ResponseApiToolDefinition {
 
 function parseToolResponse(payload: ResponseApiPayload): ToolResponseResult {
     const output = payload.output || [];
+    const refusal = output.flatMap((item) => (item.type === "message" ? item.content || [] : [])).find((item) => item.refusal)?.refusal;
+    if (refusal) throw new Error(refusal);
     const content =
         payload.output_text ||
         output
@@ -438,23 +447,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function responseErrorMessage(value: unknown) {
     if (!isRecord(value)) return "";
-    const error = isRecord(value.error) ? value.error : undefined;
     const response = isRecord(value.response) ? value.response : undefined;
-    const responseError = response && isRecord(response.error) ? response.error : undefined;
-    return stringValue(value.msg) || stringValue(error?.message) || stringValue(responseError?.message);
+    return readApiErrorMessage(value.msg) || readApiErrorMessage(value.message) || readApiErrorMessage(value.error) || readApiErrorMessage(response?.error);
 }
 
 function stringValue(value: unknown) {
     return typeof value === "string" ? value : "";
 }
 
+function parseTextStreamData(data: string) {
+    try {
+        const parsed = JSON.parse(data);
+        if (isRecord(parsed)) return parsed;
+    } catch {
+        // Keep upstream parser details out of the UI and report one stable protocol error.
+    }
+    throw new Error(apiText("textResponseIncomplete", { reason: apiText("requestFailed") }));
+}
+
 function validateResponsePayload(payload: ResponseApiPayload) {
     if (typeof payload.code === "number" && payload.code !== 0) throw new Error(payload.msg || apiText("requestFailed"));
-    if (payload.error?.message) throw new Error(payload.error.message);
+    const error = readApiErrorMessage(payload.error);
+    if (error) throw new Error(error);
+    if (payload.status === "incomplete") throw new Error(apiText("textResponseIncomplete", { reason: payload.incomplete_details?.reason || payload.status }));
+    if (payload.status === "failed" || payload.status === "cancelled") throw new Error(apiText("requestFailed"));
+}
+
+function requireCompletedResponse(payload: ResponseApiPayload) {
+    validateResponsePayload(payload);
+    if (payload.status !== "completed") throw new Error(apiText("textResponseIncomplete", { reason: payload.status || "missing_status" }));
 }
 
 function validateGeminiPayload(payload: GeminiPayload) {
-    if (payload.error?.message) throw new Error(payload.error.message);
+    const error = readApiErrorMessage(payload.error);
+    if (error) throw new Error(error);
     if (payload.promptFeedback?.blockReason) throw new Error(apiText("geminiRejected", { reason: payload.promptFeedback.blockReason }));
 }
 
@@ -464,7 +490,7 @@ async function readFetchError(response: Response, fallback: string) {
     try {
         return responseErrorMessage(JSON.parse(text)) || readStatusError(response.status, fallback);
     } catch {
-        return text.slice(0, 300) || readStatusError(response.status, fallback);
+        return readApiErrorMessage(text.slice(0, 300)) || readStatusError(response.status, fallback);
     }
 }
 
@@ -476,7 +502,7 @@ function consumeResponseStreamBlock(block: string, state: ResponseStreamState, o
         .join("\n")
         .trim();
     if (!data || data === "[DONE]") return;
-    const event = JSON.parse(data) as Record<string, unknown>;
+    const event = parseTextStreamData(data);
     const type = stringValue(event.type);
     const errorMessage = responseErrorMessage(event);
     if (errorMessage) state.error = errorMessage;
@@ -488,10 +514,17 @@ function consumeResponseStreamBlock(block: string, state: ResponseStreamState, o
         state.text = event.text;
         onDelta?.(state.text);
     }
-    if (type === "response.completed" && isRecord(event.response)) {
-        state.payload = event.response as ResponseApiPayload;
+    if (type === "response.refusal.delta" && typeof event.delta === "string") state.refusal = `${state.refusal || ""}${event.delta}`;
+    if (type === "response.refusal.done") state.error = stringValue(event.refusal) || state.refusal || apiText("requestFailed");
+    if (["response.completed", "response.incomplete", "response.failed", "response.cancelled"].includes(type) && isRecord(event.response)) {
+        const payload = event.response as ResponseApiPayload;
+        const terminal = type.slice("response.".length) as ResponseStreamState["terminal"];
+        state.terminal = terminal;
+        state.payload = { ...payload, status: payload.status || terminal };
     } else if (Array.isArray(event.output)) {
         state.payload = event as ResponseApiPayload;
+        const status = stringValue(event.status);
+        if (["completed", "incomplete", "failed", "cancelled"].includes(status)) state.terminal = status as ResponseStreamState["terminal"];
     }
 }
 
@@ -514,31 +547,62 @@ async function requestStreamingResponse(config: AiConfig, body: Record<string, u
     const response = await fetch(aiApiUrl(config, "/responses"), {
         method: "POST",
         headers: { ...aiHeaders(config, "application/json"), Accept: "text/event-stream" },
-        body: JSON.stringify({ ...body, stream: true }),
+        body: JSON.stringify({ ...body, stream: true, ...(options?.store === undefined ? {} : { store: options.store }) }),
         signal: options?.signal,
     });
     if (!response.ok) throw new Error(await readFetchError(response, apiText("requestFailed")));
-    if (!response.body) {
-        const payload = (await response.json()) as ResponseApiPayload;
-        validateResponsePayload(payload);
-        return parseToolResponse(payload);
+    const contentType = response.headers.get("content-type")?.toLowerCase() || "";
+    if (!response.body) throw new Error(apiText("textResponseIncomplete", { reason: "empty_stream" }));
+
+    if (!contentType.includes("text/event-stream")) {
+        const text = await response.text();
+        let payload: ResponseApiPayload | undefined;
+        try {
+            payload = JSON.parse(text) as ResponseApiPayload;
+        } catch (error) {
+            if (!/(?:^|\r?\n)data:/.test(text)) throw new Error(readApiErrorMessage(text.slice(0, 300)) || (error instanceof Error ? error.message : apiText("requestFailed")));
+        }
+        if (payload) {
+            requireCompletedResponse(payload);
+            return parseToolResponse(payload);
+        }
+        const state: ResponseStreamState = { buffer: "", text: "" };
+        consumeResponseStreamText(state, text, onDelta, true);
+        return completeResponseStream(state, onDelta);
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     const state: ResponseStreamState = { buffer: "", text: "" };
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        consumeResponseStreamText(state, decoder.decode(value, { stream: true }), onDelta);
-        if (state.error) throw new Error(state.error);
+    let completed = false;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            consumeResponseStreamText(state, decoder.decode(value, { stream: true }), onDelta);
+            if (state.error) throw new Error(state.error);
+            if (state.terminal) {
+                await reader.cancel().catch(() => undefined);
+                break;
+            }
+        }
+        consumeResponseStreamText(state, decoder.decode(), onDelta, true);
+        completed = true;
+    } finally {
+        if (!completed) await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
     }
-    consumeResponseStreamText(state, decoder.decode(), onDelta, true);
+    return completeResponseStream(state, onDelta);
+}
+
+function completeResponseStream(state: ResponseStreamState, onDelta?: (text: string) => void): ToolResponseResult {
     if (state.error) throw new Error(state.error);
-    if (!state.payload) return { content: state.text, toolCalls: [] };
-    validateResponsePayload(state.payload);
+    if (state.terminal !== "completed" || !state.payload) throw new Error(apiText("textResponseIncomplete", { reason: state.terminal || "connection_closed" }));
+    requireCompletedResponse(state.payload);
     const result = parseToolResponse(state.payload);
-    return { ...result, content: state.text || result.content };
+    const content = result.content || state.text;
+    if (content && content !== state.text) onDelta?.(content);
+    return { ...result, content };
 }
 
 function toGeminiBody(config: AiConfig, messages: ResponseInputMessage[], extra?: Record<string, unknown>) {
@@ -625,22 +689,50 @@ async function requestGeminiStreamingResponse(config: AiConfig, body: Record<str
         signal: options?.signal,
     });
     if (!response.ok) throw new Error(await readFetchError(response, apiText("requestFailed")));
-    if (!response.body) {
-        const payload = (await response.json()) as GeminiPayload;
-        return parseGeminiToolResponse(payload);
+    const contentType = response.headers.get("content-type")?.toLowerCase() || "";
+    if (!response.body) throw new Error(apiText("textResponseIncomplete", { reason: "empty_stream" }));
+
+    if (!contentType.includes("text/event-stream")) {
+        const text = await response.text();
+        let payload: GeminiPayload | undefined;
+        try {
+            payload = JSON.parse(text) as GeminiPayload;
+        } catch (error) {
+            if (!/(?:^|\r?\n)data:/.test(text)) throw new Error(readApiErrorMessage(text.slice(0, 300)) || (error instanceof Error ? error.message : apiText("requestFailed")));
+        }
+        if (payload) return parseGeminiToolResponse(payload, true);
+        const state: GeminiStreamState = { buffer: "", text: "", toolCalls: [], finished: false };
+        consumeGeminiStreamText(state, text, onDelta, true);
+        return completeGeminiStream(state);
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    const state: GeminiStreamState = { buffer: "", text: "", toolCalls: [] };
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        consumeGeminiStreamText(state, decoder.decode(value, { stream: true }), onDelta);
-        if (state.error) throw new Error(state.error);
+    const state: GeminiStreamState = { buffer: "", text: "", toolCalls: [], finished: false };
+    let completed = false;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            consumeGeminiStreamText(state, decoder.decode(value, { stream: true }), onDelta);
+            if (state.error) throw new Error(state.error);
+            if (state.finished) {
+                await reader.cancel().catch(() => undefined);
+                break;
+            }
+        }
+        consumeGeminiStreamText(state, decoder.decode(), onDelta, true);
+        completed = true;
+    } finally {
+        if (!completed) await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
     }
-    consumeGeminiStreamText(state, decoder.decode(), onDelta, true);
+    return completeGeminiStream(state);
+}
+
+function completeGeminiStream(state: GeminiStreamState): ToolResponseResult {
     if (state.error) throw new Error(state.error);
+    if (!state.finished) throw new Error(apiText("textResponseIncomplete", { reason: "connection_closed" }));
     return { content: state.text, toolCalls: state.toolCalls };
 }
 
@@ -667,7 +759,9 @@ function consumeGeminiStreamBlock(block: string, state: GeminiStreamState, onDel
         .join("\n")
         .trim();
     if (!data || data === "[DONE]") return;
-    const result = parseGeminiToolResponse(JSON.parse(data) as GeminiPayload);
+    const payload = parseTextStreamData(data) as GeminiPayload;
+    const result = parseGeminiToolResponse(payload);
+    if (payload.candidates?.some((candidate) => candidate.finishReason === "STOP")) state.finished = true;
     if (result.content) {
         state.text += result.content;
         onDelta?.(state.text);
@@ -675,8 +769,12 @@ function consumeGeminiStreamBlock(block: string, state: GeminiStreamState, onDel
     state.toolCalls.push(...result.toolCalls);
 }
 
-function parseGeminiToolResponse(payload: GeminiPayload): ToolResponseResult {
+function parseGeminiToolResponse(payload: GeminiPayload, requireStop = false): ToolResponseResult {
     validateGeminiPayload(payload);
+    const finishReason = payload.candidates?.map((candidate) => candidate.finishReason).find((reason) => reason && reason !== "STOP");
+    if (finishReason === "MAX_TOKENS") throw new Error(apiText("textResponseIncomplete", { reason: finishReason }));
+    if (finishReason) throw new Error(apiText("geminiRejected", { reason: finishReason }));
+    if (requireStop && !payload.candidates?.some((candidate) => candidate.finishReason === "STOP")) throw new Error(apiText("textResponseIncomplete", { reason: "missing_finish_reason" }));
     const parts = payload.candidates?.flatMap((candidate) => candidate.content?.parts || []) || [];
     const content = parts.map((part) => part.text || "").join("");
     const toolCalls = parts
@@ -696,15 +794,14 @@ function parseGeminiToolResponse(payload: GeminiPayload): ToolResponseResult {
 }
 
 async function requestGeminiImages(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
-    const requests = Array.from({ length: count }, () => requestGeminiImagesOnce(config, prompt, references, options));
+    const referenceDataUrls = await Promise.all(references.map((image) => imageToDataUrl(image, options?.signal)));
+    const requests = Array.from({ length: count }, () => requestGeminiImagesOnce(config, prompt, referenceDataUrls, options));
     return (await Promise.all(requests)).flat();
 }
 
-async function requestGeminiImagesOnce(config: AiConfig, prompt: string, references: ReferenceImage[], options?: RequestOptions) {
+async function requestGeminiImagesOnce(config: AiConfig, prompt: string, references: string[], options?: RequestOptions) {
     const parts: GeminiPart[] = [{ text: prompt }];
-    for (const image of references) {
-        parts.push(toGeminiImagePart(await imageToDataUrl(image)));
-    }
+    references.forEach((dataUrl) => parts.push(toGeminiImagePart(dataUrl)));
     const response = await axios.post<GeminiPayload>(
         geminiApiUrl(config, "generateContent"),
         {
@@ -718,6 +815,9 @@ async function requestGeminiImagesOnce(config: AiConfig, prompt: string, referen
 
 function parseGeminiImagePayload(payload: GeminiPayload) {
     validateGeminiPayload(payload);
+    const finishReason = payload.candidates?.map((candidate) => candidate.finishReason).find((reason) => reason && reason !== "STOP");
+    if (finishReason === "MAX_TOKENS") throw new Error(apiText("textResponseIncomplete", { reason: finishReason }));
+    if (finishReason) throw new Error(apiText("geminiRejected", { reason: finishReason }));
     const images =
         payload.candidates
             ?.flatMap((candidate) => candidate.content?.parts || [])
@@ -771,12 +871,10 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             {
                 model: requestConfig.model,
                 prompt: withSystemPrompt(requestConfig, prompt),
-                n,
+                n: Math.min(n, 10),
                 ...(quality ? { quality } : {}),
                 ...(requestSize ? { size: requestSize } : {}),
                 ...(background ? { background } : {}),
-                response_format: "b64_json",
-                output_format: IMAGE_OUTPUT_FORMAT,
             },
             {
                 headers: aiHeaders(requestConfig, "application/json"),
@@ -799,7 +897,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         const quality = normalizeQuality(config.quality);
         const requestSize = resolveRequestSize(quality, config.size);
         const background = normalizeBackground(config.background);
-        const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
+        const refs = await Promise.all(references.map((image) => imageToDataUrl(image, options?.signal)));
         try {
             const result = await runModelPlugin({
                 capability: "image",
@@ -823,6 +921,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, apiText("requestFailed")));
         }
     }
+    if (references.length > MAX_OPENAI_EDIT_REFERENCES) throw new Error(i18n.t("imageWorkbench.editReferenceLimit", { count: MAX_OPENAI_EDIT_REFERENCES }));
 
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
@@ -830,9 +929,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     const formData = new FormData();
     formData.set("model", requestConfig.model);
     formData.set("prompt", withSystemPrompt(requestConfig, requestPrompt));
-    formData.set("n", String(n));
-    formData.set("response_format", "b64_json");
-    formData.set("output_format", IMAGE_OUTPUT_FORMAT);
+    formData.set("n", String(Math.min(n, 10)));
     if (quality) {
         formData.set("quality", quality);
     }
@@ -842,9 +939,10 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (background) {
         formData.set("background", background);
     }
-    const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
-    files.forEach((file) => formData.append("image", file));
-    if (mask) formData.set("mask", dataUrlToFile(mask));
+    const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image, options?.signal) })));
+    const imageField = files.length > 1 ? "image[]" : "image";
+    files.forEach((file) => formData.append(imageField, file));
+    if (mask) formData.set("mask", dataUrlToFile({ ...mask, dataUrl: await imageToDataUrl(mask, options?.signal) }));
 
     try {
         const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
@@ -860,16 +958,21 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
     const script = resolveModelScript(config, config.model || config.textModel);
     if (script) {
         try {
+            const pluginMessages = withSystemMessage(requestConfig, messages);
             const answer = await runModelPlugin<string>({
                 capability: "text",
                 script,
                 config: requestConfig,
-                messages: withSystemMessage(requestConfig, messages),
+                images: messageImageUrls(pluginMessages),
+                messages: pluginMessages,
                 signal: options?.signal,
-                onDelta,
+                onDelta: (value: unknown) => {
+                    if (typeof value !== "string") throw new Error(apiText("noContent"));
+                    onDelta(value);
+                },
             });
-            const text = String(answer ?? "").trim() || apiText("noContent");
-            if (text === apiText("noContent")) onDelta(text);
+            if (typeof answer !== "string" || !answer.trim()) throw new Error(apiText("noContent"));
+            const text = answer.trim();
             return text;
         } catch (error) {
             throw new Error(readAxiosError(error, apiText("requestFailed")));

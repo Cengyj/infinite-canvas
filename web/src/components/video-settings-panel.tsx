@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
 import { type CanvasTheme } from "@/lib/canvas-theme";
+import { normalizeVideoFrameSize, normalizeVideoSeconds } from "@/lib/video-config";
 import { type AiConfig } from "@/stores/use-config-store";
 
 const resolutionOptions = [
@@ -36,7 +37,7 @@ type VideoSettingsPanelProps = {
 
 export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5" }: VideoSettingsPanelProps) {
     const { t } = useTranslation();
-    const seconds = config.videoSeconds || "6";
+    const seconds = normalizeVideoSeconds(config.videoSeconds);
     const size = normalizeVideoSizeValue(config.size);
     const dimensions = readSizeDimensions(size);
     const resolution = normalizeVideoResolutionValue(config.vquality);
@@ -113,14 +114,11 @@ export function videoSizeLabel(value: string) {
 }
 
 export function videoSecondsLabel(value: string) {
-    if (String(value).trim() === "-1") return i18n.t("settingsPanels.video.smart");
-    return `${value || "6"}s`;
+    return `${normalizeVideoSeconds(value)}s`;
 }
 
 export function normalizeVideoSizeValue(value: string) {
-    if (value === "auto") return "auto";
-    if (/^\d+x\d+$/.test(value || "")) return value;
-    return ["9:16", "2:3", "3:4"].includes(value) ? "720x1280" : "1280x720";
+    return normalizeVideoFrameSize(value);
 }
 
 export function normalizeVideoResolutionValue(value: string) {

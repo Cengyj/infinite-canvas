@@ -3,7 +3,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
-import { localForageStorage } from "@/lib/localforage-storage";
+import { isLocalForageStorageReadReliable, localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
@@ -23,6 +23,7 @@ export type CanvasProject = {
 
 type CanvasStore = {
     hydrated: boolean;
+    storageReady: boolean;
     projects: CanvasProject[];
     createProject: (title?: string) => string;
     importProject: (project: Partial<CanvasProject>) => string;
@@ -64,6 +65,7 @@ export const useCanvasStore = create<CanvasStore>()(
     persist(
         (set, get) => ({
             hydrated: false,
+            storageReady: false,
             projects: [],
             createProject: (title = i18n.t("canvas.project.untitled")) => {
                 const now = new Date().toISOString();
@@ -127,8 +129,8 @@ export const useCanvasStore = create<CanvasStore>()(
                 ({
                     projects: state.projects,
                 }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => () => {
-                useCanvasStore.setState({ hydrated: true });
+            onRehydrateStorage: () => (_state, error) => {
+                useCanvasStore.setState({ hydrated: true, storageReady: !error && isLocalForageStorageReadReliable(CANVAS_STORE_KEY) });
             },
         },
     ),
