@@ -29,7 +29,7 @@ export function imageMetadata(image: UploadedImage): CanvasNodeMetadata {
 }
 
 export function videoMetadata(video: UploadedFile): CanvasNodeMetadata {
-    return { content: video.url, storageKey: video.storageKey, status: "success", naturalWidth: video.width, naturalHeight: video.height, bytes: video.bytes, mimeType: video.mimeType || "video/mp4", durationMs: video.durationMs };
+    return { content: video.url, storageKey: video.storageKey, status: "success", naturalWidth: video.width, naturalHeight: video.height, aspectRatio: video.aspectRatio, bytes: video.bytes, mimeType: video.mimeType || "video/mp4", durationMs: video.durationMs };
 }
 
 export function audioMetadata(audio: UploadedFile): CanvasNodeMetadata {
@@ -59,6 +59,18 @@ export function buildAudioGenerationMetadata(config: AiConfig): CanvasNodeMetada
         audioFormat: config.audioFormat,
         audioSpeed: config.audioSpeed,
         audioInstructions: config.audioInstructions,
+    };
+}
+
+export function buildVideoGenerationMetadata(config: AiConfig, references: ReferenceImage[] = []): CanvasNodeMetadata {
+    return {
+        model: config.model,
+        size: config.size,
+        seconds: config.videoSeconds,
+        vquality: config.vquality,
+        generateAudio: config.videoGenerateAudio,
+        watermark: config.videoWatermark,
+        references: references.map(referenceUrl).filter((url): url is string => Boolean(url)),
     };
 }
 

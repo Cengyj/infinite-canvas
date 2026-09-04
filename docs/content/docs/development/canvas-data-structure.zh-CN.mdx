@@ -101,6 +101,7 @@ type CanvasNodeMetadata = {
   count?: number;
   naturalWidth?: number;
   naturalHeight?: number;
+  aspectRatio?: string;
   freeResize?: boolean;
   images?: CanvasNodeImage[];
   primaryImageId?: string;
@@ -114,10 +115,10 @@ type CanvasNodeMetadata = {
 不同节点的使用方式：
 
 - 图片节点：`content` 是当前可展示的图片 URL，通常是 `blob:` URL；`storageKey` 指向本地图片 Blob；`naturalWidth/naturalHeight/bytes/mimeType` 保存原图信息。
-- 视频节点：`content` 是当前可播放的视频 URL，通常是 `blob:` URL；`storageKey` 指向本地视频 Blob；`bytes/mimeType` 保存文件信息。
+- 视频节点：`content` 是当前可播放的视频 URL，通常是 `blob:` URL；`storageKey` 指向本地视频 Blob；`naturalWidth/naturalHeight` 仅保存媒体文件或上游明确提供的真实像素尺寸，`aspectRatio` 只在真实尺寸不可用时作为布局回退；`bytes/mimeType` 保存文件信息。
 - 文本节点：`content` 保存文本内容；`fontSize` 保存字体大小；`prompt/status/errorDetails` 保存生成状态。
 - 生成配置节点：`generationMode/model/size/count/inputOrder` 保存生成配置；`generationMode` 可选择文本、图片或视频；上游输入通过 `connections` 计算。
-- 多图图片节点：批量生成仍只保存为一个图片节点，请求开始前会在 `images` 中创建全部图片槽位，每个槽位通过 `status/errorDetails` 独立记录实时状态，成功后补充图片数据；最先成功的槽位会立即写入 `primaryImageId`，并由节点级 `content` 和图片元数据展示；展开状态仅属于当前界面，不写入项目数据。
+- 多图图片节点：批量生成仍只保存为一个图片节点，请求开始前会在 `images` 中创建全部图片槽位，每个槽位通过 `status/errorDetails` 独立记录实时状态，成功后补充图片数据；最先成功的槽位会立即写入 `primaryImageId`，并由节点级 `content` 和图片元数据展示；展开状态和子图选择仅属于当前界面，不写入项目数据，子图也不作为独立画布节点参与拖拽、连线或节点操作。
 
 ## 连线结构
 

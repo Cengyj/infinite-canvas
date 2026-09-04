@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { ChevronRight, Copy, Download, Group, Image as ImageIcon, Music2, Puzzle, RefreshCw, Star, Trash2, Video } from "lucide-react";
+import { ChevronRight, Download, Group, Image as ImageIcon, Music2, Puzzle, RefreshCw, Star, Trash2, Video } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes } from "@/lib/image-utils";
+import { normalizeVideoRatio } from "@/lib/video-config";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { buildNodeContext } from "@/lib/canvas/plugin-node-context";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -15,6 +16,14 @@ import { useTranslation } from "react-i18next";
 
 type ResizeCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
 const selectionBlue = "#2f80ff";
+
+function mediaAspectRatio(data: CanvasNodeData) {
+    if (data.type !== CanvasNodeType.Video) return 0;
+    const ratio = normalizeVideoRatio(data.metadata?.aspectRatio || data.metadata?.size || "");
+    if (!ratio) return 0;
+    const [width, height] = ratio.split(":").map(Number);
+    return width > 0 && height > 0 ? width / height : 0;
+}
 
 type CanvasNodeProps = {
     data: CanvasNodeData;
@@ -34,6 +43,7 @@ type CanvasNodeProps = {
     groupChildCount?: number;
     isGroupDropTarget?: boolean;
     batchExpanded?: boolean;
+    selectedBatchImageId?: string;
     onMouseDown: (event: React.MouseEvent, nodeId: string) => void;
     onSelectCapture?: (event: React.MouseEvent, nodeId: string) => void;
     onHoverStart: (nodeId: string) => void;
@@ -45,8 +55,8 @@ type CanvasNodeProps = {
     onContentChange: (nodeId: string, content: string) => void;
     onTitleChange: (nodeId: string, title: string) => void;
     onToggleBatch?: (nodeId: string) => void;
+    onSelectBatchImage?: (nodeId: string, imageId: string) => void;
     onSetBatchPrimary?: (nodeId: string, imageId: string) => void;
-    onDuplicateBatchImage?: (node: CanvasNodeData, imageId: string) => void;
     onDownloadBatchImage?: (node: CanvasNodeData, imageId: string) => void;
     onRetryBatchImage?: (node: CanvasNodeData, imageId: string) => void;
     onDeleteBatchImage?: (nodeId: string, imageId: string) => void;
@@ -64,6 +74,7 @@ type NodeContentRendererProps = {
     isBatchRoot: boolean;
     batchCount: number;
     batchExpanded: boolean;
+    selectedBatchImageId?: string;
     renderNodeContent?: (node: CanvasNodeData) => ReactNode;
     pluginContext?: CanvasNodeContext | null;
     onContentChange: (nodeId: string, content: string) => void;
@@ -72,8 +83,8 @@ type NodeContentRendererProps = {
     onRetry?: (node: CanvasNodeData) => void;
     onGenerateImage?: (node: CanvasNodeData) => void;
     onToggleBatch?: () => void;
+    onSelectBatchImage?: (imageId: string) => void;
     onSetBatchPrimary?: (imageId: string) => void;
-    onDuplicateBatchImage?: (imageId: string) => void;
     onDownloadBatchImage?: (imageId: string) => void;
     onRetryBatchImage?: (imageId: string) => void;
     onDeleteBatchImage?: (imageId: string) => void;
@@ -98,6 +109,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     groupChildCount = 0,
     isGroupDropTarget = false,
     batchExpanded = false,
+    selectedBatchImageId,
     onMouseDown,
     onSelectCapture,
     onHoverStart,
@@ -109,8 +121,8 @@ export const CanvasNode = React.memo(function CanvasNode({
     onContentChange,
     onTitleChange,
     onToggleBatch,
+    onSelectBatchImage,
     onSetBatchPrimary,
-    onDuplicateBatchImage,
     onDownloadBatchImage,
     onRetryBatchImage,
     onDeleteBatchImage,
@@ -278,7 +290,7 @@ export const CanvasNode = React.memo(function CanvasNode({
             startWidth: data.width,
             startHeight: data.height,
             keepRatio: (data.type === CanvasNodeType.Image && !data.metadata?.freeResize) || data.type === CanvasNodeType.Video || Boolean(definition?.keepAspectRatio?.(data)),
-            ratio: (data.metadata?.naturalWidth || data.width) / (data.metadata?.naturalHeight || data.height || 1),
+            ratio: mediaAspectRatio(data) || (data.metadata?.naturalWidth || data.width) / (data.metadata?.naturalHeight || data.height || 1),
         };
         window.addEventListener("mousemove", handleResizeMove);
         window.addEventListener("mouseup", handleResizeUp);
@@ -310,10 +322,13 @@ export const CanvasNode = React.memo(function CanvasNode({
                 setHovered(false);
                 onHoverEnd(data.id);
             }}
-            onMouseDownCapture={(event) => onSelectCapture?.(event, data.id)}
+            onMouseDownCapture={(event) => {
+                if (event.target instanceof Element && event.target.closest("[data-batch-image-id]")) return;
+                onSelectCapture?.(event, data.id);
+            }}
             onContextMenu={(event) => onContextMenu(event, data.id)}
         >
-            {(isSelected || hovered || isEditingTitle) && (
+            {(isSelected || (hovered && !selectedBatchImageId) || isEditingTitle) && (
                 <div className="absolute left-3 top-[-28px] z-[65] max-w-[calc(100%-24px)]" onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
                     {isEditingTitle ? (
                         <input
@@ -390,6 +405,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                         isBatchRoot={isBatchRoot}
                         batchCount={batchCount}
                         batchExpanded={batchExpanded}
+                        selectedBatchImageId={selectedBatchImageId}
                         renderNodeContent={renderNodeContent}
                         pluginContext={pluginContext}
                         mentionReferences={mentionReferences}
@@ -398,8 +414,8 @@ export const CanvasNode = React.memo(function CanvasNode({
                         onRetry={onRetry}
                         onGenerateImage={onGenerateImage}
                         onToggleBatch={() => onToggleBatch?.(data.id)}
+                        onSelectBatchImage={(imageId) => onSelectBatchImage?.(data.id, imageId)}
                         onSetBatchPrimary={(imageId) => onSetBatchPrimary?.(data.id, imageId)}
-                        onDuplicateBatchImage={(imageId) => onDuplicateBatchImage?.(data, imageId)}
                         onDownloadBatchImage={(imageId) => onDownloadBatchImage?.(data, imageId)}
                         onRetryBatchImage={(imageId) => onRetryBatchImage?.(data, imageId)}
                         onDeleteBatchImage={(imageId) => onDeleteBatchImage?.(data.id, imageId)}
@@ -418,8 +434,8 @@ export const CanvasNode = React.memo(function CanvasNode({
                 <ResizeHandle corner="bottom-right" onMouseDown={handleResizeMouseDown} />
             </div>
 
-            {!isGroup ? <ConnectionHandleDot side="left" visible={hovered || isSelected || isConnecting} onMouseDown={(event) => onConnectStart(event, data.id, "target")} /> : null}
-            {!isGroup ? <ConnectionHandleDot side="right" visible={(definition?.hasSourceHandle ?? true) && data.type !== CanvasNodeType.Config && (hovered || isSelected || isConnecting)} onMouseDown={(event) => onConnectStart(event, data.id, "source")} /> : null}
+            {!isGroup ? <ConnectionHandleDot side="left" visible={(hovered && !selectedBatchImageId) || isSelected || isConnecting} onMouseDown={(event) => onConnectStart(event, data.id, "target")} /> : null}
+            {!isGroup ? <ConnectionHandleDot side="right" visible={(definition?.hasSourceHandle ?? true) && data.type !== CanvasNodeType.Config && ((hovered && !selectedBatchImageId) || isSelected || isConnecting)} onMouseDown={(event) => onConnectStart(event, data.id, "source")} /> : null}
 
             {showPanel && !isGroup && renderPanel ? <div className="absolute left-1/2 top-full z-[70] w-[600px] -translate-x-1/2 pt-4">{renderPanel(data)}</div> : null}
         </div>
@@ -574,9 +590,10 @@ function ImageNodeContent(props: NodeContentRendererProps) {
         <ImageContent
             node={props.node}
             batchExpanded={props.batchExpanded}
+            selectedBatchImageId={props.selectedBatchImageId}
             onToggleBatch={props.onToggleBatch}
+            onSelectBatchImage={props.onSelectBatchImage}
             onSetBatchPrimary={props.onSetBatchPrimary}
-            onDuplicateBatchImage={props.onDuplicateBatchImage}
             onDownloadBatchImage={props.onDownloadBatchImage}
             onRetryBatchImage={props.onRetryBatchImage}
             onDeleteBatchImage={props.onDeleteBatchImage}
@@ -632,9 +649,10 @@ function AudioNodeContent({ node, theme }: NodeContentRendererProps) {
 function ImageContent({
     node,
     batchExpanded,
+    selectedBatchImageId,
     onToggleBatch,
+    onSelectBatchImage,
     onSetBatchPrimary,
-    onDuplicateBatchImage,
     onDownloadBatchImage,
     onRetryBatchImage,
     onDeleteBatchImage,
@@ -642,9 +660,10 @@ function ImageContent({
 }: {
     node: CanvasNodeData;
     batchExpanded: boolean;
+    selectedBatchImageId?: string;
     onToggleBatch?: () => void;
+    onSelectBatchImage?: (imageId: string) => void;
     onSetBatchPrimary?: (imageId: string) => void;
-    onDuplicateBatchImage?: (imageId: string) => void;
     onDownloadBatchImage?: (imageId: string) => void;
     onRetryBatchImage?: (imageId: string) => void;
     onDeleteBatchImage?: (imageId: string) => void;
@@ -664,7 +683,7 @@ function ImageContent({
             {batchExpanded
                 ? images
                       .filter((image) => image.id !== primaryImageId)
-                      .map((image, index) => <ExpandedImageCard key={image.id} node={node} image={image} index={index} onView={() => onViewBatchImage?.(image.id)} onSetPrimary={() => onSetBatchPrimary?.(image.id)} onDuplicate={() => onDuplicateBatchImage?.(image.id)} onDownload={() => onDownloadBatchImage?.(image.id)} onRetry={() => onRetryBatchImage?.(image.id)} onDelete={() => onDeleteBatchImage?.(image.id)} />)
+                      .map((image, index) => <ExpandedImageCard key={image.id} node={node} image={image} index={index} selected={selectedBatchImageId === image.id} onSelect={() => onSelectBatchImage?.(image.id)} onView={() => onViewBatchImage?.(image.id)} onSetPrimary={() => onSetBatchPrimary?.(image.id)} onRetry={() => onRetryBatchImage?.(image.id)} onDelete={() => onDeleteBatchImage?.(image.id)} />)
                 : null}
             <div className="h-full w-full overflow-hidden rounded-3xl">
                 {primaryContent ? (
@@ -707,7 +726,7 @@ function ImageContent({
     );
 }
 
-function ExpandedImageCard({ node, image, index, onView, onSetPrimary, onDuplicate, onDownload, onRetry, onDelete }: { node: CanvasNodeData; image: CanvasNodeImage; index: number; onView: () => void; onSetPrimary: () => void; onDuplicate: () => void; onDownload: () => void; onRetry: () => void; onDelete: () => void }) {
+function ExpandedImageCard({ node, image, index, selected, onSelect, onView, onSetPrimary, onRetry, onDelete }: { node: CanvasNodeData; image: CanvasNodeImage; index: number; selected: boolean; onSelect: () => void; onView: () => void; onSetPrimary: () => void; onRetry: () => void; onDelete: () => void }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { t } = useTranslation();
     const count = node.metadata?.images?.length || 0;
@@ -722,7 +741,12 @@ function ExpandedImageCard({ node, image, index, onView, onSetPrimary, onDuplica
 
     return (
         <div
-            className="absolute z-20 overflow-hidden rounded-3xl border shadow-[0_18px_50px_rgba(28,25,23,.18)]"
+            data-batch-image-id={image.id}
+            role="button"
+            tabIndex={0}
+            aria-pressed={selected}
+            aria-label={`${node.title} ${index + 1}`}
+            className="absolute z-20 cursor-pointer overflow-hidden rounded-3xl border outline-none shadow-[0_18px_50px_rgba(28,25,23,.18)]"
             style={
                 {
                     left: x,
@@ -730,7 +754,8 @@ function ExpandedImageCard({ node, image, index, onView, onSetPrimary, onDuplica
                     width: node.width,
                     height: node.height,
                     background: theme.node.panel,
-                    borderColor: theme.node.stroke,
+                    borderColor: selected ? selectionBlue : theme.node.stroke,
+                    boxShadow: selected ? `0 0 0 2px ${selectionBlue}66, 0 18px 50px rgba(28,25,23,.18)` : undefined,
                     "--batch-from-x": `${-x}px`,
                     "--batch-from-y": `${-y}px`,
                     "--batch-from-rotate": `${4 + index * 2}deg`,
@@ -738,7 +763,21 @@ function ExpandedImageCard({ node, image, index, onView, onSetPrimary, onDuplica
                 } as React.CSSProperties
             }
             onMouseDown={(event) => event.stopPropagation()}
-            onPointerDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => {
+                event.stopPropagation();
+                if (event.button === 0 && !(event.target instanceof Element && event.target.closest("button"))) onSelect();
+            }}
+            onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+            }}
+            onFocus={onSelect}
+            onKeyDown={(event) => {
+                if (event.target instanceof Element && event.target.closest("button")) return;
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                onSelect();
+            }}
             onDoubleClick={(event) => {
                 if (!image.content || (event.target instanceof Element && event.target.closest("button"))) return;
                 event.stopPropagation();
@@ -747,18 +786,10 @@ function ExpandedImageCard({ node, image, index, onView, onSetPrimary, onDuplica
         >
             {image.content ? <img src={image.content} alt={node.title} draggable={false} className="pointer-events-none h-full w-full select-none object-contain" /> : <ImageSlotStatus image={image} />}
             {image.content ? (
-                <div className="absolute inset-x-2 top-2 flex items-center gap-1">
-                    <button type="button" className="flex h-8 min-w-0 flex-1 items-center justify-center gap-1 rounded-lg border px-1.5 text-[10px] font-medium shadow-[0_6px_18px_rgba(15,23,42,.16)] backdrop-blur-md transition hover:scale-[1.02]" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.toolbar.activeText }} title={t("common.download")} onClick={(event) => (event.stopPropagation(), onDownload())}>
-                        <Download className="size-3 shrink-0" />
-                        <span className="truncate">{t("common.download")}</span>
-                    </button>
-                    <button type="button" className="flex h-8 min-w-0 flex-1 items-center justify-center gap-1 rounded-lg border px-1.5 text-[10px] font-medium shadow-[0_6px_18px_rgba(15,23,42,.16)] backdrop-blur-md transition hover:scale-[1.02]" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.toolbar.activeText }} title={t("canvas.node.createCopy")} onClick={(event) => (event.stopPropagation(), onDuplicate())}>
-                        <Copy className="size-3 shrink-0" />
-                        <span className="truncate">{t("canvas.node.createCopy")}</span>
-                    </button>
-                    <button type="button" className="flex h-8 min-w-0 flex-1 items-center justify-center gap-1 rounded-lg border px-1.5 text-[10px] font-medium shadow-[0_6px_18px_rgba(15,23,42,.16)] backdrop-blur-md transition hover:scale-[1.02]" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.toolbar.activeText }} title={t("canvas.node.setPrimary")} onClick={(event) => (event.stopPropagation(), onSetPrimary())}>
+                <div className="absolute right-2 top-2">
+                    <button type="button" className="flex h-8 items-center justify-center gap-1 rounded-lg border px-2 text-[10px] font-medium shadow-[0_6px_18px_rgba(15,23,42,.16)] backdrop-blur-md transition hover:scale-[1.02]" style={{ background: theme.toolbar.panel, borderColor: theme.toolbar.border, color: theme.toolbar.activeText }} title={t("canvas.node.setPrimary")} onClick={(event) => (event.stopPropagation(), onSetPrimary())}>
                         <Star className="size-3 shrink-0" style={{ color: selectionBlue }} />
-                        <span className="truncate">{t("canvas.node.setPrimary")}</span>
+                        <span>{t("canvas.node.setPrimary")}</span>
                     </button>
                 </div>
             ) : null}

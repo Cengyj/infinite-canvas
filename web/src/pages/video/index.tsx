@@ -10,14 +10,14 @@ import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/a
 import { ModelPicker } from "@/components/model-picker";
 import { PromptOptimizeDialog } from "@/components/prompt-optimize-dialog";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
-import { VideoSettingsPanel, normalizeVideoResolutionValue, normalizeVideoSizeValue, videoSizeLabel } from "@/components/video-settings-panel";
+import { VideoSettingsPanel, videoSizeLabel } from "@/components/video-settings-panel";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { normalizeVideoSeconds } from "@/lib/video-config";
+import { normalizeVideoFrameSize, normalizeVideoResolution, normalizeVideoSeconds } from "@/lib/video-config";
 import { deleteStoredMedia, resolveMediaUrl } from "@/services/file-storage";
 import { createImageStorageLease, deleteStoredImages, registerActiveImageStorageKeys, resolveImageUrl, uploadImage } from "@/services/image-storage";
-import { createVideoGenerationTask, MAX_VIDEO_REFERENCE_IMAGES, pollVideoGenerationTask, storeGeneratedVideo, type VideoGenerationTask } from "@/services/api/video";
+import { createVideoGenerationTask, MAX_VIDEO_REFERENCE_IMAGES, storeGeneratedVideo, waitForVideoGenerationTask, type VideoGenerationTask } from "@/services/api/video";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { boolConfig, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
@@ -32,6 +32,7 @@ type GeneratedVideo = {
     durationMs: number;
     width: number;
     height: number;
+    aspectRatio?: string;
     bytes: number;
     mimeType: string;
 };
@@ -52,7 +53,7 @@ type GenerationLog = {
     model: string;
     config: GenerationLogConfig;
     references: ReferenceImage[];
-    durationMs: number;
+    elapsedMs: number;
     size: string;
     resolution: string;
     seconds: string;
@@ -82,7 +83,6 @@ type PromptOptimizationBinding = {
 
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
-const LOG_STORE_KEY = "infinite-canvas:video_generation_logs";
 const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
 
 export default function VideoPage() {
@@ -91,7 +91,9 @@ export default function VideoPage() {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
     const activeLogIdsRef = useRef<Set<string>>(new Set());
-    const config = useConfigStore((state) => state.config);
+    const deletedLogIdsRef = useRef<Set<string>>(new Set());
+    const createControllerRef = useRef<AbortController | null>(null);
+    const pollControllersRef = useRef(new Map<string, AbortController>());
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
@@ -142,6 +144,9 @@ export default function VideoPage() {
     useEffect(
         () => () => {
             referenceEpochRef.current += 1;
+            createControllerRef.current?.abort();
+            pollControllersRef.current.forEach((controller) => controller.abort());
+            pollControllersRef.current.clear();
             activeReferencesDisposeRef.current?.();
             cleanupImages();
         },
@@ -250,26 +255,32 @@ export default function VideoPage() {
             return;
         }
         const lease = createImageStorageLease(snapshot.references.flatMap((reference) => (reference.storageKey ? [reference.storageKey] : [])));
+        const controller = new AbortController();
+        createControllerRef.current = controller;
         setElapsedMs(0);
         setRunning(true);
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
         setPreviewLog(null);
         setResults([{ id: nanoid(), status: "pending" }]);
+        const createdAt = Date.now();
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
         try {
-            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references);
-            const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: 0, status: "pending", task });
+            const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references, { signal: controller.signal });
+            const log = buildLog({ prompt: snapshot.text, model: snapshot.config.model, config: snapshot.config, references: snapshot.references, createdAt, elapsedMs: 0, status: "pending", task });
             await saveLog(log, false);
+            if (controller.signal.aborted) return;
             void pollGenerationLog(log, snapshot.config, agentTaskId);
         } catch (error) {
+            if (controller.signal.aborted) return;
             const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
             setResults([{ id: nanoid(), status: "failed", error: errorMessage }]);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
             setRunning(false);
-            await saveLog(buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: performance.now() - batchStartedAt, status: "failed", error: errorMessage }));
+            await saveLog(buildLog({ prompt: snapshot.text, model: snapshot.config.model, config: snapshot.config, references: snapshot.references, createdAt, elapsedMs: performance.now() - batchStartedAt, status: "failed", error: errorMessage }));
             message.error(errorMessage);
         } finally {
+            if (createControllerRef.current === controller) createControllerRef.current = null;
             lease.release();
         }
     };
@@ -341,7 +352,7 @@ export default function VideoPage() {
             coverUrl: "",
             tags: [],
             source: t("videoWorkbench.source"),
-            data: { url: video.url, storageKey: video.storageKey, width: video.width, height: video.height, bytes: video.bytes, mimeType: video.mimeType },
+            data: { url: video.url, storageKey: video.storageKey, width: video.width, height: video.height, aspectRatio: video.aspectRatio, durationMs: video.durationMs, bytes: video.bytes, mimeType: video.mimeType },
             metadata: { source: "video-page", prompt },
         });
         message.success(t("common.addedToAssets"));
@@ -370,6 +381,8 @@ export default function VideoPage() {
     };
 
     const deleteSelectedLogs = () => {
+        selectedLogIds.forEach((id) => deletedLogIdsRef.current.add(id));
+        selectedLogIds.forEach((id) => pollControllersRef.current.get(id)?.abort());
         const mediaKeys = logs
             .filter((log) => selectedLogIds.includes(log.id))
             .map((log) => log.video?.storageKey)
@@ -387,7 +400,12 @@ export default function VideoPage() {
     };
 
     const saveLog = async (log: GenerationLog, resumePending = true) => {
+        if (deletedLogIdsRef.current.has(log.id)) return;
         await logStore.setItem(log.id, serializeLog(log));
+        if (deletedLogIdsRef.current.has(log.id)) {
+            await logStore.removeItem(log.id);
+            return;
+        }
         await refreshLogs(resumePending);
     };
 
@@ -407,43 +425,44 @@ export default function VideoPage() {
     const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string) => {
         if (!log.task || activeLogIdsRef.current.has(log.id)) return;
         activeLogIdsRef.current.add(log.id);
+        const controller = new AbortController();
+        pollControllersRef.current.set(log.id, controller);
         setRunning(true);
         setStartedAt((value) => value || performance.now());
         setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
         try {
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
-                if (state.status === "completed") {
-                    const stored = await storeGeneratedVideo(state.result);
-                    const nextVideo: GeneratedVideo = {
-                        id: nanoid(),
-                        url: stored.url,
-                        storageKey: stored.storageKey,
-                        durationMs: Date.now() - log.createdAt,
-                        width: stored.width || 1280,
-                        height: stored.height || 720,
-                        bytes: stored.bytes,
-                        mimeType: stored.mimeType,
-                    };
-                    setResults([{ id: nextVideo.id, status: "success", video: nextVideo }]);
-                    if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
-                    await saveLog({ ...log, status: "success", durationMs: nextVideo.durationMs, video: nextVideo, error: undefined });
-                    message.success(t("videoWorkbench.generated"));
-                    return;
-                }
-                if (state.status === "failed") throw new Error(state.error);
-                if (attempt === 119) throw new Error(t("videoWorkbench.timeout"));
-                await delay(2500);
+            const result = await waitForVideoGenerationTask(configOverride || taskConfig, log.task, { signal: controller.signal });
+            const stored = await storeGeneratedVideo(result);
+            if (controller.signal.aborted || deletedLogIdsRef.current.has(log.id)) {
+                if (stored.storageKey) await deleteStoredMedia([stored.storageKey]);
+                return;
             }
+            const nextVideo: GeneratedVideo = {
+                id: nanoid(),
+                url: stored.url,
+                storageKey: stored.storageKey,
+                durationMs: stored.durationMs || 0,
+                width: stored.width || 0,
+                height: stored.height || 0,
+                aspectRatio: stored.aspectRatio,
+                bytes: stored.bytes,
+                mimeType: stored.mimeType,
+            };
+            setResults([{ id: nextVideo.id, status: "success", video: nextVideo }]);
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
+            await saveLog({ ...log, status: "success", elapsedMs: Date.now() - log.createdAt, video: nextVideo, error: undefined });
+            message.success(t("videoWorkbench.generated"));
         } catch (error) {
+            if (controller.signal.aborted) return;
             const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
             setResults([{ id: log.id, status: "failed", error: errorMessage }]);
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
-            await saveLog({ ...log, status: "failed", durationMs: Date.now() - log.createdAt, error: errorMessage });
+            await saveLog({ ...log, status: "failed", elapsedMs: Date.now() - log.createdAt, error: errorMessage });
             message.error(errorMessage);
         } finally {
             activeLogIdsRef.current.delete(log.id);
+            if (pollControllersRef.current.get(log.id) === controller) pollControllersRef.current.delete(log.id);
             if (!activeLogIdsRef.current.size) {
                 setRunning(false);
                 setStartedAt(0);
@@ -527,7 +546,7 @@ export default function VideoPage() {
                                                     references: references.map((reference) => ({ ...reference })),
                                                     generationMode: references.length ? "image-to-video" : "text-to-video",
                                                     durationSeconds: normalizeVideoSeconds(effectiveConfig.videoSeconds),
-                                                    frameSize: normalizeVideoSize(effectiveConfig.size),
+                                                    frameSize: normalizeVideoFrameSize(effectiveConfig.size),
                                                     audioEnabled: boolConfig(effectiveConfig.videoGenerateAudio, true),
                                                 })
                                             }
@@ -577,7 +596,7 @@ export default function VideoPage() {
 
                             <div className="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm dark:border-stone-800 dark:bg-stone-900 sm:hidden">
                                 <span className="truncate text-stone-500 dark:text-stone-400">
-                                    {modelOptionLabel(effectiveConfig, model)} · {normalizeResolution(effectiveConfig.vquality)}p · {videoSizeLabel(effectiveConfig.size)} · {normalizeVideoSeconds(effectiveConfig.videoSeconds)}s
+                                    {modelOptionLabel(effectiveConfig, model)} · {normalizeVideoResolution(effectiveConfig.vquality)}p · {videoSizeLabel(effectiveConfig.size)} · {normalizeVideoSeconds(effectiveConfig.videoSeconds)}s
                                 </span>
                                 <Button size="small" type="text" icon={<SlidersHorizontal className="size-4" />} onClick={() => setSettingsOpen(true)}>
                                     {t("workbench.adjust")}
@@ -699,14 +718,15 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
 
 function ResultVideoCard({ video, onDownload, onSaveAsset }: { video: GeneratedVideo; onDownload: (video: GeneratedVideo) => void; onSaveAsset: (video: GeneratedVideo) => void }) {
     const { t } = useTranslation();
+    const aspectRatio = video.width && video.height ? `${video.width} / ${video.height}` : (video.aspectRatio || "16:9").replace(":", " / ");
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
-            <video src={video.url} controls className="aspect-video w-full bg-black object-contain" />
+            <div className="flex justify-center bg-black">
+                <video src={video.url} controls className="w-full max-h-[70vh] max-w-full object-contain" style={{ aspectRatio }} />
+            </div>
             <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
                 <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-xs text-stone-500 dark:text-stone-400">
-                    <span>
-                        {video.width}x{video.height}
-                    </span>
+                    {video.width && video.height ? <span>{video.width}x{video.height}</span> : video.aspectRatio ? <span>{video.aspectRatio}</span> : null}
                     <span>{formatBytes(video.bytes)}</span>
                     <span>{formatDuration(video.durationMs)}</span>
                 </div>
@@ -821,7 +841,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                         {t(`workbench.${log.status === "success" ? "success" : log.status === "pending" ? "generating" : "failed"}`)}
                     </Tag>
                     <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="green">
-                        {formatDuration(log.durationMs)}
+                        {formatDuration(log.elapsedMs)}
                     </Tag>
                 </div>
             </div>
@@ -860,9 +880,9 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         model: log.model || config.videoModel || "",
         config,
         references,
-        durationMs: log.durationMs || 0,
+        elapsedMs: log.elapsedMs || 0,
         size: log.size || config.size || "",
-        resolution: normalizeResolution(log.resolution || config.vquality || ""),
+        resolution: normalizeVideoResolution(log.resolution || config.vquality || ""),
         seconds: log.seconds || config.videoSeconds || "",
         status: log.status || "success",
         task: log.task,
@@ -902,33 +922,33 @@ function normalizeLogConfig(log: Partial<GenerationLog>): GenerationLogConfig {
         model: log.config?.model || log.model || "",
         videoModel: log.config?.videoModel || log.model || "",
         size: log.config?.size || log.size || "",
-        vquality: normalizeResolution(log.config?.vquality || log.resolution || ""),
+        vquality: normalizeVideoResolution(log.config?.vquality || log.resolution || ""),
         videoSeconds: log.config?.videoSeconds || log.seconds || "",
         videoGenerateAudio: log.config?.videoGenerateAudio || "true",
         videoWatermark: log.config?.videoWatermark || "false",
     };
 }
 
-function buildLog({ prompt, model, config, references, durationMs, status, task, video, error }: { prompt: string; model: string; config: AiConfig; references: ReferenceImage[]; durationMs: number; status: GenerationLog["status"]; task?: VideoGenerationTask; video?: GeneratedVideo; error?: string }): GenerationLog {
+function buildLog({ prompt, model, config, references, createdAt = Date.now(), elapsedMs, status, task, video, error }: { prompt: string; model: string; config: AiConfig; references: ReferenceImage[]; createdAt?: number; elapsedMs: number; status: GenerationLog["status"]; task?: VideoGenerationTask; video?: GeneratedVideo; error?: string }): GenerationLog {
     const logConfig = {
         model: config.model,
         videoModel: config.videoModel,
         size: config.size,
-        vquality: normalizeResolution(config.vquality),
+        vquality: normalizeVideoResolution(config.vquality),
         videoSeconds: config.videoSeconds,
         videoGenerateAudio: config.videoGenerateAudio,
         videoWatermark: config.videoWatermark,
     };
     return {
         id: nanoid(),
-        createdAt: Date.now(),
+        createdAt,
         title: prompt.slice(0, 12) || i18n.t("workbench.untitled"),
         prompt,
-        time: new Date().toLocaleString(i18n.resolvedLanguage, { hour12: false }),
+        time: new Date(createdAt).toLocaleString(i18n.resolvedLanguage, { hour12: false }),
         model,
         config: logConfig,
         references,
-        durationMs,
+        elapsedMs,
         size: logConfig.size,
         resolution: logConfig.vquality,
         seconds: logConfig.videoSeconds,
@@ -944,26 +964,13 @@ function buildVideoConfig(config: AiConfig, model: string): AiConfig {
         ...config,
         model,
         videoModel: model,
-        size: normalizeVideoSize(config.size),
         videoSeconds: normalizeVideoSeconds(config.videoSeconds),
-        vquality: normalizeResolution(config.vquality),
+        vquality: normalizeVideoResolution(config.vquality),
         videoGenerateAudio: String(boolConfig(config.videoGenerateAudio, true)),
         videoWatermark: String(boolConfig(config.videoWatermark, false)),
     };
 }
 
 function videoOptimizationContextKey(config: AiConfig) {
-    return [normalizeVideoSeconds(config.videoSeconds), normalizeVideoSize(config.size), boolConfig(config.videoGenerateAudio, true)].join("|");
-}
-
-function normalizeVideoSize(value: string) {
-    return normalizeVideoSizeValue(value);
-}
-
-function normalizeResolution(value: string) {
-    return normalizeVideoResolutionValue(value);
-}
-
-function delay(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return [normalizeVideoSeconds(config.videoSeconds), normalizeVideoFrameSize(config.size), boolConfig(config.videoGenerateAudio, true)].join("|");
 }

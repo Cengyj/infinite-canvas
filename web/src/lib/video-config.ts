@@ -1,3 +1,6 @@
+export const VIDEO_POLL_INTERVAL_MS = 3000;
+export const VIDEO_POLL_TIMEOUT_MS = 20 * 60 * 1000;
+
 export function normalizeVideoSeconds(value: string) {
     const seconds = Math.floor(Number(value) || 6);
     return String(Math.max(1, Math.min(20, seconds)));
@@ -7,6 +10,16 @@ export function normalizeVideoFrameSize(value: string) {
     if (value === "auto") return "auto";
     if (/^\d+x\d+$/.test(value || "")) return value;
     return ["9:16", "2:3", "3:4"].includes(value) ? "720x1280" : "1280x720";
+}
+
+export function normalizeVideoResolution(value: string) {
+    if (value === "480p" || value === "low") return "480";
+    if (value === "720p" || value === "auto" || value === "high" || value === "medium") return "720";
+    return value.replace(/p$/i, "") || "720";
+}
+
+export function normalizeVideoResolutionName(value: string) {
+    return `${normalizeVideoResolution(value)}p`;
 }
 
 /** Return a canonical width:height ratio for model-call scripts. */

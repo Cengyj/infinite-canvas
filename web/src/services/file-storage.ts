@@ -1,7 +1,7 @@
 import localforage from "localforage";
 import { nanoid } from "nanoid";
 
-export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
+export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number; aspectRatio?: string };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
 const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
@@ -13,7 +13,7 @@ export async function uploadMediaFile(input: string | Blob, prefix = "file"): Pr
     await store.setItem(storageKey, blob);
     const url = URL.createObjectURL(blob);
     objectUrls.set(storageKey, url);
-    const meta = blob.type.startsWith("video/") ? await readVideoMeta(url) : blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
+    const meta = prefix === "video" || blob.type.startsWith("video/") ? await readVideoMeta(url) : prefix === "audio" || blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
     return { url, storageKey, bytes: blob.size, mimeType: blob.type || "application/octet-stream", ...meta };
 }
 
@@ -80,11 +80,18 @@ export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()
 }
 
 function readVideoMeta(url: string) {
-    return new Promise<{ width: number; height: number; durationMs?: number }>((resolve) => {
+    return new Promise<{ width?: number; height?: number; durationMs?: number }>((resolve) => {
         const video = document.createElement("video");
-        const done = () => resolve({ width: video.videoWidth || 1280, height: video.videoHeight || 720, durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : undefined });
+        const done = () => {
+            const meta = { width: video.videoWidth || undefined, height: video.videoHeight || undefined, durationMs: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : undefined };
+            video.onloadedmetadata = null;
+            video.onerror = null;
+            video.removeAttribute("src");
+            resolve(meta);
+        };
         video.onloadedmetadata = done;
         video.onerror = done;
+        video.preload = "metadata";
         video.src = url;
     });
 }

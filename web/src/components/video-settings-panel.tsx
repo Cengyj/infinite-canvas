@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import { normalizeVideoFrameSize, normalizeVideoSeconds } from "@/lib/video-config";
+import { normalizeVideoFrameSize, normalizeVideoResolution, normalizeVideoSeconds } from "@/lib/video-config";
 import { type AiConfig } from "@/stores/use-config-store";
 
 const resolutionOptions = [
@@ -38,9 +38,9 @@ type VideoSettingsPanelProps = {
 export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5" }: VideoSettingsPanelProps) {
     const { t } = useTranslation();
     const seconds = normalizeVideoSeconds(config.videoSeconds);
-    const size = normalizeVideoSizeValue(config.size);
+    const size = normalizeVideoFrameSize(config.size);
     const dimensions = readSizeDimensions(size);
-    const resolution = normalizeVideoResolutionValue(config.vquality);
+    const resolution = normalizeVideoResolution(config.vquality);
     const updateDimension = (key: "width" | "height", value: number | null) => {
         const next = Math.max(1, Math.floor(value || dimensions[key] || 720));
         onConfigChange("size", `${key === "width" ? next : dimensions.width}x${key === "height" ? next : dimensions.height}`);
@@ -103,28 +103,18 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
 }
 
 export function videoResolutionLabel(value: string) {
-    return `${normalizeVideoResolutionValue(value)}p`;
+    return `${normalizeVideoResolution(value)}p`;
 }
 
 export function videoSizeLabel(value: string) {
     if (value === "adaptive" || value === "auto") return i18n.t("settingsPanels.video.adaptive");
-    const size = normalizeVideoSizeValue(value);
+    const size = normalizeVideoFrameSize(value);
     const option = sizeOptions.find((item) => item.value === size);
     return option ? i18n.t(`settingsPanels.video.sizes.${option.labelKey}`) : size;
 }
 
 export function videoSecondsLabel(value: string) {
     return `${normalizeVideoSeconds(value)}s`;
-}
-
-export function normalizeVideoSizeValue(value: string) {
-    return normalizeVideoFrameSize(value);
-}
-
-export function normalizeVideoResolutionValue(value: string) {
-    if (value === "480p" || value === "low") return "480";
-    if (value === "720p" || value === "auto" || value === "high" || value === "medium") return "720";
-    return value.replace(/p$/i, "") || "720";
 }
 
 function OptionPill({ selected, disabled = false, theme, onClick, children }: { selected: boolean; disabled?: boolean; theme: CanvasTheme; onClick: () => void; children: ReactNode }) {

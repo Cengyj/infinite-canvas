@@ -1,6 +1,7 @@
 import axios, { type AxiosRequestConfig } from "axios";
 
 import i18n from "@/i18n";
+import { VIDEO_POLL_INTERVAL_MS, VIDEO_POLL_TIMEOUT_MS } from "@/lib/video-config";
 import { buildApiUrl, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 
 type RequestOptions = { signal?: AbortSignal };
@@ -291,25 +292,34 @@ const size = String(params.size || "").trim();
 if (size && !["720x1280", "1280x720", "1024x1792", "1792x1024"].includes(size)) {
   throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSizeUnsupported"))});
 }
-const task = await http.post("/videos", {
-  model, prompt, seconds,
-  ...(size ? { size } : {}),
-  ...(images[0] ? { input_reference: { image_url: images[0] } } : {}),
-});
-if (!task?.id) throw new Error(${JSON.stringify(i18n.t("apiErrors.noVideoTaskId"))});
-const taskId = encodeURIComponent(String(task.id));
+const form = new FormData();
+form.set("model", model);
+form.set("prompt", prompt);
+form.set("seconds", seconds);
+if (size) form.set("size", size);
+if (images[0]) {
+  const response = await fetch(images[0], { signal });
+  if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
+  form.set("input_reference", await response.blob(), "reference.png");
+}
+const task = await http.post("/videos", form); // ${i18n.t("modelPlugin.templates.formDataHeader")}
+const rawTaskId = task?.id || task?.task_id || task?.request_id;
+if (!rawTaskId) throw new Error(${JSON.stringify(i18n.t("apiErrors.noVideoTaskId"))});
+const taskId = encodeURIComponent(String(rawTaskId));
 const completed = await poll(
   () => http.get(\`/videos/\${taskId}\`),
   (state) => {
-    if (state.status === "failed" || state.status === "cancelled") {
+    const status = String(state.status || "").toLowerCase();
+    if (["failed", "fail", "error", "cancelled", "canceled"].includes(status)) {
       const error = typeof state.error === "string" ? state.error : state.error?.message;
-      throw new Error(error || state.message || ${JSON.stringify(i18n.t("apiErrors.videoGenerationFailed"))});
+      throw new Error(error || state.error_message || state.fail_reason || state.message || ${JSON.stringify(i18n.t("apiErrors.videoGenerationFailed"))});
     }
-    return state.status === "completed" ? state : null;
+    const progress = Number(String(state.progress || "").replace(/%$/, ""));
+    return ["completed", "complete", "success", "succeeded", "done", "finished"].includes(status) || progress >= 100 ? state : null;
   },
-  { intervalMs: 2500, timeoutMs: 300000 },
+  { intervalMs: ${VIDEO_POLL_INTERVAL_MS}, timeoutMs: ${VIDEO_POLL_TIMEOUT_MS} },
 );
-const url = completed.video_url || completed.url;
+const url = completed.video_url || completed.result_url || completed.download_url || completed.url;
 return url ? { url } : await http.get(\`/videos/\${taskId}/content\`, { responseType: "blob" });`,
         },
         {
