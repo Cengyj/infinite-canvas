@@ -240,6 +240,18 @@ export function isCurrentThreadEvent(event: { threadId?: string; thread_id?: str
     return Boolean(threadId) && threadId === useAgentStore.getState().activeThreadId;
 }
 
+/** Reject delayed tool calls from another thread/turn or browser client. */
+export function isCurrentToolCall(event: { threadId?: string; thread_id?: string; turnId?: string; turn_id?: string; sourceClientId?: string; projectId?: string }, clientId?: string) {
+    const state = useAgentStore.getState();
+    const threadId = event.threadId || event.thread_id || "";
+    const turnId = event.turnId || event.turn_id || "";
+    if (threadId && threadId !== state.activeThreadId) return false;
+    if (turnId && turnId !== state.activeTurnId) return false;
+    if (event.sourceClientId && clientId && event.sourceClientId !== clientId) return false;
+    if (event.projectId && event.projectId !== state.canvasContext?.snapshot.projectId) return false;
+    return true;
+}
+
 export function registerLiveAgentTurn(
     event: { replayed?: boolean; threadId?: string; thread_id?: string; turnId?: string; turn_id?: string },
     authoritativeTurns: ReadonlySet<string>,

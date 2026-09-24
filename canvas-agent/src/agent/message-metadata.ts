@@ -9,6 +9,7 @@ type MessageMetadataRecord = { version: 1; clientMessageId: string; threadId?: s
 type MetadataMessage = { role: string; threadId: string; turnId: string; clientMessageId?: string };
 
 const STORAGE_VERSION = 1;
+const MAX_ID_LENGTH = 200;
 const MAX_PREVIEW_LENGTH = 500_000;
 const MAX_TEXT_LENGTH = 20_000;
 const MANIFEST_FILE = "manifest.json";
@@ -24,49 +25,61 @@ export class MessageMetadataStore {
 
     recordPending(clientMessageId: string, value: unknown) {
         return this.run(async () => {
+            const messageId = normalizeIdentifier(clientMessageId, "client message id");
             const metadata = normalizeMetadata(value, false);
-            if (!clientMessageId || !metadata) return undefined;
+            if (!messageId) return undefined;
             await this.ensureReady();
-            const storedMetadata = await persistMetadataPreviews(this.directory, clientMessageId, metadata);
-            const record: MessageMetadataRecord = { version: STORAGE_VERSION, clientMessageId, createdAt: Date.now(), metadata: storedMetadata };
-            await writeJson(this.pendingFile(clientMessageId), record);
+            if (await hasExistingRecord(this.directory, messageId)) {
+                throw new Error("Message client id is already in use; refusing to overwrite metadata.");
+            }
+            if (!metadata) return undefined;
+            const storedMetadata = await persistMetadataPreviews(this.directory, messageId, metadata);
+            const record: MessageMetadataRecord = { version: STORAGE_VERSION, clientMessageId: messageId, createdAt: Date.now(), metadata: storedMetadata };
+            await writeJson(this.pendingFile(messageId), record);
             return structuredClone(storedMetadata);
         });
     }
 
     bindThread(clientMessageId: string, threadId: string) {
         return this.run(async () => {
-            if (!clientMessageId || !threadId) return;
+            const messageId = normalizeIdentifier(clientMessageId, "client message id");
+            const targetThreadId = normalizeIdentifier(threadId, "thread id");
+            if (!messageId || !targetThreadId) return;
             await this.ensureReady();
-            const pendingFile = this.pendingFile(clientMessageId);
-            const targetFile = this.threadFile(threadId, clientMessageId);
+            const pendingFile = this.pendingFile(messageId);
+            const targetFile = this.threadFile(targetThreadId, messageId);
             const record = await readRecord(targetFile) || await readRecord(pendingFile);
             if (!record) return;
-            await writeJson(targetFile, { ...record, threadId, turnId: record.threadId === threadId ? record.turnId : undefined });
+            await writeJson(targetFile, { ...record, threadId: targetThreadId, turnId: record.threadId === targetThreadId ? record.turnId : undefined });
             await removeFile(pendingFile);
         });
     }
 
     bindTurn(clientMessageId: string, threadId: string, turnId: string) {
         return this.run(async () => {
-            if (!clientMessageId || !threadId || !turnId) return;
+            const messageId = normalizeIdentifier(clientMessageId, "client message id");
+            const targetThreadId = normalizeIdentifier(threadId, "thread id");
+            const targetTurnId = normalizeIdentifier(turnId, "turn id");
+            if (!messageId || !targetThreadId || !targetTurnId) return;
             await this.ensureReady();
-            const pendingFile = this.pendingFile(clientMessageId);
-            const targetFile = this.threadFile(threadId, clientMessageId);
+            const pendingFile = this.pendingFile(messageId);
+            const targetFile = this.threadFile(targetThreadId, messageId);
             const record = await readRecord(targetFile) || await readRecord(pendingFile);
             if (!record) return;
-            await writeJson(targetFile, { ...record, threadId, turnId });
+            await writeJson(targetFile, { ...record, threadId: targetThreadId, turnId: targetTurnId });
             await removeFile(pendingFile);
         });
     }
 
     mergeThread<T extends MetadataMessage>(threadId: string, messages: T[]) {
         return this.run<Array<T & AgentMessageMetadata>>(async () => {
+            const targetThreadId = normalizeIdentifier(threadId, "thread id");
+            if (!targetThreadId) return messages;
             await this.ensureReady();
-            const records = (await readRecords(this.threadDirectory(threadId))).filter((item) => item.threadId === threadId && item.turnId);
+            const records = (await readRecords(this.threadDirectory(targetThreadId))).filter((item) => item.threadId === targetThreadId && item.turnId);
             const byTurnId = new Map(records.map((item) => [item.turnId!, item]));
             return messages.map((message) => {
-                if (message.role !== "user" || message.threadId !== threadId) return message;
+                if (message.role !== "user" || message.threadId !== targetThreadId) return message;
                 const record = byTurnId.get(message.turnId);
                 return record ? { ...message, clientMessageId: record.clientMessageId, ...structuredClone(record.metadata) } : message;
             });
@@ -75,23 +88,26 @@ export class MessageMetadataStore {
 
     remove(clientMessageId: string, threadId = "") {
         return this.run(async () => {
-            if (!clientMessageId) return;
+            const messageId = normalizeIdentifier(clientMessageId, "client message id");
+            const targetThreadId = normalizeIdentifier(threadId, "thread id");
+            if (!messageId) return;
             await this.ensureReady();
             await Promise.all([
-                removeFile(this.pendingFile(clientMessageId)),
-                ...(threadId ? [removeFile(this.threadFile(threadId, clientMessageId))] : []),
-                fs.rm(this.assetDirectory(clientMessageId), { recursive: true, force: true }),
+                removeFile(this.pendingFile(messageId)),
+                ...(targetThreadId ? [removeFile(this.threadFile(targetThreadId, messageId))] : []),
+                fs.rm(this.assetDirectory(messageId), { recursive: true, force: true }),
             ]);
         });
     }
 
     removeThread(threadId: string) {
         return this.run(async () => {
-            if (!threadId) return;
+            const targetThreadId = normalizeIdentifier(threadId, "thread id");
+            if (!targetThreadId) return;
             await this.ensureReady();
-            const records = await readRecords(this.threadDirectory(threadId));
+            const records = await readRecords(this.threadDirectory(targetThreadId));
             await Promise.all([
-                fs.rm(this.threadDirectory(threadId), { recursive: true, force: true }),
+                fs.rm(this.threadDirectory(targetThreadId), { recursive: true, force: true }),
                 ...records.map((record) => fs.rm(this.assetDirectory(record.clientMessageId), { recursive: true, force: true })),
             ]);
         });
@@ -102,7 +118,9 @@ export class MessageMetadataStore {
             await this.ensureReady();
             if (!/^[a-f0-9]{64}$/.test(messageKey) || !/^[a-f0-9]{64}\.(?:gif|jpe?g|png|webp)$/.test(assetFile)) return undefined;
             try {
-                return { data: await fs.readFile(path.join(this.directory, "assets", messageKey, assetFile)), contentType: assetContentType(assetFile) };
+                const file = path.join(this.directory, "assets", messageKey, assetFile);
+                await assertNoSymlinkComponents(file, "message asset");
+                return { data: await fs.readFile(file), contentType: assetContentType(assetFile) };
             } catch (error) {
                 if (isMissing(error)) return undefined;
                 throw error;
@@ -123,9 +141,12 @@ export class MessageMetadataStore {
 
     private async initialize() {
         const manifestFile = path.join(this.directory, MANIFEST_FILE);
+        await assertNoSymlinkComponents(this.directory, "message metadata directory");
         try {
+            await assertNotSymlink(manifestFile, "message metadata manifest");
             const manifest = await readJson(manifestFile) as { version?: unknown };
             if (manifest.version !== STORAGE_VERSION) throw unsupportedVersion(manifest.version);
+            await tightenStoragePermissions(this.directory);
             return;
         } catch (error) {
             if (!isMissing(error)) throw error;
@@ -157,14 +178,26 @@ export const messageMetadataStore = new MessageMetadataStore();
 async function createStorage(directory: string) {
     const temporaryDirectory = `${directory}.${process.pid}.${Date.now()}.tmp`;
     try {
-        await fs.mkdir(path.join(temporaryDirectory, "pending"), { recursive: true });
-        await fs.mkdir(path.join(temporaryDirectory, "threads"), { recursive: true });
-        await fs.mkdir(path.join(temporaryDirectory, "assets"), { recursive: true });
+        await fs.mkdir(path.join(temporaryDirectory, "pending"), { recursive: true, mode: 0o700 });
+        await fs.mkdir(path.join(temporaryDirectory, "threads"), { recursive: true, mode: 0o700 });
+        await fs.mkdir(path.join(temporaryDirectory, "assets"), { recursive: true, mode: 0o700 });
         await writeJson(path.join(temporaryDirectory, MANIFEST_FILE), { version: STORAGE_VERSION });
         await fs.rename(temporaryDirectory, directory);
+        await fs.chmod(directory, 0o700);
     } finally {
         await fs.rm(temporaryDirectory, { recursive: true, force: true });
     }
+}
+
+async function tightenStoragePermissions(directory: string) {
+    for (const name of ["pending", "threads", "assets"] as const) {
+        const child = path.join(directory, name);
+        await assertNotSymlink(child, `message metadata ${name} directory`);
+        await fs.mkdir(child, { recursive: true, mode: 0o700 });
+        await fs.chmod(child, 0o700);
+    }
+    await fs.chmod(directory, 0o700);
+    await fs.chmod(path.join(directory, MANIFEST_FILE), 0o600);
 }
 
 async function readRecords(directory: string) {
@@ -178,15 +211,41 @@ async function readRecords(directory: string) {
     return (await Promise.all(files.map(readRecord))).filter((item): item is MessageMetadataRecord => Boolean(item));
 }
 
+/** 查找仍存活的 pending 或已绑定记录，避免复用 ID 覆盖其预览资产。 */
+async function hasExistingRecord(directory: string, clientMessageId: string) {
+    const pending = await readRecord(path.join(directory, "pending", `${storageKey(clientMessageId)}.json`));
+    if (pending) {
+        if (pending.clientMessageId !== clientMessageId) throw new Error("Message metadata client id does not match its storage key.");
+        return true;
+    }
+    let entries: import("node:fs").Dirent[];
+    try {
+        entries = await fs.readdir(path.join(directory, "threads"), { withFileTypes: true });
+    } catch (error) {
+        if (isMissing(error)) return false;
+        throw error;
+    }
+    const fileName = `${storageKey(clientMessageId)}.json`;
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const record = await readRecord(path.join(directory, "threads", entry.name, fileName));
+        if (!record) continue;
+        if (record.clientMessageId !== clientMessageId) throw new Error("Message metadata client id does not match its storage key.");
+        return true;
+    }
+    return false;
+}
+
 async function readRecord(file: string): Promise<MessageMetadataRecord | undefined> {
     try {
+        await assertNotSymlink(file, "message metadata record");
         const value = await readJson(file) as Partial<MessageMetadataRecord>;
         if (value.version !== STORAGE_VERSION) throw unsupportedVersion(value.version);
-        const clientMessageId = text(value.clientMessageId, 200);
+        const clientMessageId = normalizeIdentifier(value.clientMessageId, "stored client message id");
         const metadata = normalizeMetadata(value.metadata, true);
         if (!clientMessageId || !metadata) throw new Error(`Message metadata record is invalid: ${file}`);
-        const threadId = text(value.threadId, 200);
-        const turnId = text(value.turnId, 200);
+        const threadId = normalizeIdentifier(value.threadId, "stored thread id");
+        const turnId = normalizeIdentifier(value.turnId, "stored turn id");
         return { version: STORAGE_VERSION, clientMessageId, createdAt: Number(value.createdAt) || 0, metadata, ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) };
     } catch (error) {
         if (isMissing(error)) return undefined;
@@ -277,6 +336,14 @@ function text(value: unknown, limit: number) {
     return typeof value === "string" ? value.trim().slice(0, limit) : "";
 }
 
+function normalizeIdentifier(value: unknown, label: string) {
+    if (value === undefined || value === null || value === "") return "";
+    if (typeof value !== "string") throw new Error(`Message metadata ${label} must be a string.`);
+    const normalized = value.trim();
+    if (normalized.length > MAX_ID_LENGTH) throw new Error(`Message metadata ${label} exceeds the limit of ${MAX_ID_LENGTH}.`);
+    return normalized;
+}
+
 function storageKey(value: string) {
     return crypto.createHash("sha256").update(value).digest("hex");
 }
@@ -334,13 +401,25 @@ async function writeJson(file: string, value: unknown) {
 }
 
 async function writeFile(file: string, value: string | Buffer) {
-    await fs.mkdir(path.dirname(file), { recursive: true });
+    await assertNoSymlinkComponents(path.dirname(file), "message metadata path");
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
     const temporaryFile = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let temporaryCreated = false;
     try {
-        await fs.writeFile(temporaryFile, value);
+        await assertNotSymlink(file, "message metadata file");
+        handle = await fs.open(temporaryFile, "wx", 0o600);
+        temporaryCreated = true;
+        await handle.writeFile(value);
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        await assertNotSymlink(file, "message metadata file");
         await fs.rename(temporaryFile, file);
+        await fs.chmod(file, 0o600);
     } finally {
-        await removeFile(temporaryFile);
+        await handle?.close().catch(() => undefined);
+        if (temporaryCreated) await removeFile(temporaryFile);
     }
 }
 
@@ -357,6 +436,31 @@ async function exists(file: string) {
     } catch (error) {
         if (isMissing(error)) return false;
         throw error;
+    }
+}
+
+async function assertNotSymlink(file: string, label: string) {
+    try {
+        if ((await fs.lstat(file)).isSymbolicLink()) throw new Error(`${label} must not be a symbolic link`);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+    }
+}
+
+async function assertNoSymlinkComponents(target: string, label: string) {
+    const resolved = path.resolve(target);
+    const root = path.parse(resolved).root;
+    const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+    let current = root;
+    for (const part of parts) {
+        current = path.join(current, part);
+        try {
+            if ((await fs.lstat(current)).isSymbolicLink()) throw new Error(`${label} must not contain symbolic links: ${current}`);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
+        }
     }
 }
 

@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
 import { useCopyText } from "@/hooks/use-copy-text";
+import { useMediaReferences } from "@/hooks/use-media-references";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { MAX_PROMPT_OPTIMIZATION_REFERENCES, requestPromptOptimization, type PromptOptimizationContext, type PromptOptimizationScenario } from "@/services/api/prompt-optimization";
@@ -37,6 +38,7 @@ const MODAL_STYLES: ModalProps["styles"] = {
 };
 
 export function PromptOptimizeDialog({ scenario, prompt, references, context, appearance = "workbench", disabled = false, onApply, onClose }: PromptOptimizeDialogProps) {
+    useMediaReferences(() => references);
     const { message } = App.useApp();
     const { t } = useTranslation();
     const copyText = useCopyText();
@@ -67,7 +69,7 @@ export function PromptOptimizeDialog({ scenario, prompt, references, context, ap
     const inputStyle = canvasAppearance ? { background: "transparent" } : undefined;
     const modalStyles: ModalProps["styles"] = canvasAppearance
         ? {
-              content: {
+              container: {
                   background: canvasTheme.toolbar.panel,
                   border: `1px solid ${canvasTheme.toolbar.border}`,
                   borderRadius: 20,
@@ -207,7 +209,7 @@ export function PromptOptimizeDialog({ scenario, prompt, references, context, ap
             width={canvasAppearance ? 860 : 880}
             zIndex={canvasAppearance ? 1120 : 1050}
             keyboard={!optimizing}
-            maskClosable={!optimizing}
+            mask={{ closable: !optimizing }}
             closable={!optimizing}
             style={canvasAppearance ? { maxWidth: "calc(100vw - 24px)" } : undefined}
             styles={modalStyles}

@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { App, Button, Tooltip } from "antd";
 import dayjs from "dayjs";
 import { Bot, History, MessageSquare, PanelRightClose, PlugZap, Plus, Sparkles, Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
+import { readAgentUrlBootstrap } from "@/lib/agent/agent-url-bootstrap";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { upscaleDataUrl } from "@/lib/canvas/canvas-image-data";
 import { imageMetadata } from "@/lib/canvas/canvas-node-factory";
@@ -24,6 +25,7 @@ import { acknowledgeCodexHistory, activateAgentClient, AgentApiError, discoverAg
 import { AgentChatTimeline, AgentTaskProgress, AgentUsageBar } from "./agent-chat";
 import { AgentChatComposer } from "./agent-chat-composer";
 import { AgentConnectView } from "./agent-connect-view";
+import { GENERATED_IMAGE_MAX_BYTES, generatedImageFileName, importGeneratedImageSources, isSuccessfulImageGeneration } from "./agent-generated-images";
 import {
     activityDeltaFallback,
     activityDetail,
@@ -43,6 +45,7 @@ import {
     isCanvasWriteTool,
     isConnectionErrorMessage,
     isCurrentThreadEvent,
+    isCurrentToolCall,
     isReasoningSummary,
     mergeAgentMessages,
     mergeStreamText,
@@ -71,7 +74,7 @@ const MAX_ATTACHMENT_PAYLOAD_BYTES = 28 * 1024 * 1024;
 const MESSAGE_PREVIEW_LONG_EDGE = 192;
 const MESSAGE_PREVIEW_MAX_LENGTH = 500_000;
 const DEFAULT_AGENT_URL = "http://127.0.0.1:17371";
-const AGENT_PROTOCOL_VERSION = 6;
+const AGENT_PROTOCOL_VERSION = 7;
 const HISTORY_RETRY_DELAYS_MS = [0, 150, 350, 700, 1200];
 const AGENT_REASONING_EFFORTS = new Set<AgentReasoningEffort>(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const rt = (key: string, options?: Record<string, unknown>) => i18n.t(`agent.runtime.${key}`, options);
@@ -86,6 +89,7 @@ type AgentCodexState = { busy?: boolean; threadId?: string; turnId?: string };
 type AgentHelloEvent = { ok?: boolean; protocolVersion?: number; clientId?: string; workspace?: { activeThreadId?: string }; conversation?: AgentConversationState; codex?: AgentCodexState; pendingApprovals?: AgentPendingApproval[] };
 type AgentWorkspaceEvent = { activeThreadId?: string; threadId?: string; sourceClientId?: string; emptyThread?: boolean; draftThread?: boolean; conversation?: AgentConversationState };
 type AgentChatEvent = { threadId?: string; turnId?: string; sourceClientId?: string; replayed?: boolean; message?: AgentChatItem };
+type CanvasProjectScope = { projectId: string; revision: number };
 type AgentBootstrapEvent = { type?: "codex.preparing" | "codex.prepare_failed" | "mcp.startup" | "mcp.complete"; phase?: "preheat" | "runtime"; threadId?: string; name?: string; status?: "starting" | "ready" | "failed" | "cancelled"; error?: string | null; failureReason?: string | null };
 type AgentClientGlobal = typeof globalThis & { __infiniteCanvasAgentClientIdPromise?: Promise<string> };
 
@@ -126,6 +130,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const { message, modal } = App.useApp();
+    const { hash } = useLocation();
     const [searchParams] = useSearchParams();
     const navigate = useNavigate();
     // Field-level selectors with useShallow rerender only when these fields change.
@@ -174,6 +179,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const skillCount = useAgentSkillStore((state) => state.skills.length);
     const messageCount = useAgentStore((state) => state.messages.length);
     const canvasContextRef = useRef<AgentCanvasContext | null>(useAgentStore.getState().canvasContext);
+    const canvasProjectIdRef = useRef(canvasContextRef.current?.snapshot.projectId || "");
+    const canvasProjectRevisionRef = useRef(0);
+    const pendingTurnProjectScopeRef = useRef<CanvasProjectScope | null>(null);
+    const turnProjectScopesRef = useRef(new Map<string, CanvasProjectScope>());
     const confirmToolsRef = useRef(confirmTools);
     const pendingToolRef = useRef<AgentPendingToolCall | null>(null);
     const autoConnectRef = useRef(false);
@@ -319,6 +328,11 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         let timer: ReturnType<typeof setTimeout> | null = null;
         const unsubscribe = useAgentStore.subscribe((state) => {
             if (state.canvasContext === canvasContextRef.current) return;
+            const projectId = state.canvasContext?.snapshot.projectId || "";
+            if (projectId !== canvasProjectIdRef.current) {
+                canvasProjectIdRef.current = projectId;
+                canvasProjectRevisionRef.current += 1;
+            }
             canvasContextRef.current = state.canvasContext;
             if (!useAgentStore.getState().connected) return;
             if (timer) clearTimeout(timer);
@@ -362,7 +376,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 protocolRejected = true;
                 source.close();
                 connectedRef.current = false;
-                setAgentState({ enabled: false, connected: false, waiting: false, sending: false, activity: rt("restartRequired"), connectError: text, silentConnect: false, pendingTool: null, pendingApprovals: [] });
+                setAgentState({ enabled: false, connected: false, waiting: false, sending: false, activity: rt("restartRequired"), connectError: text, silentConnect: false, fragmentBootstrap: false, pendingTool: null, pendingApprovals: [] });
                 useAgentSkillStore.getState().reset();
                 addEventLog(rt("versionMismatch"), text, hello);
                 if (!headless) message.error(text);
@@ -390,6 +404,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 sending: false,
                 connectError: "",
                 silentConnect: false,
+                fragmentBootstrap: false,
                 activeThreadId: nextThreadId,
                 activeTurnId,
                 messages,
@@ -433,7 +448,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         source.addEventListener("tool_call", (event) => {
             if (!isCurrentConnection()) return;
             const data = parseEventData<AgentPendingToolCall>(event);
-            if (data) void handleToolCall(endpoint, token, data);
+            if (data && isCurrentToolCall(data, clientId)) void handleToolCall(endpoint, token, { ...data, clientProjectRevision: canvasProjectRevisionRef.current });
         });
         source.addEventListener("codex_approval", (event) => {
             if (!isCurrentConnection()) return;
@@ -459,7 +474,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 if (!isCurrentThreadEvent(data)) return;
                 const shouldProcess = registerLiveAgentTurn(data, authoritativeHistoryTurnsRef.current, liveTurnKeysRef.current);
                 if (data.type !== "usage.updated" && !shouldProcess) return;
-                return handleAgentEvent(data);
+                return handleAgentEvent(data, isCurrentConnection);
             });
         });
         source.addEventListener("agent_bootstrap", (event) => {
@@ -536,6 +551,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             enqueueEvent(() => {
                 if (!isCurrentThreadEvent(data)) return;
                 if (!registerLiveAgentTurn(data, authoritativeHistoryTurnsRef.current, liveTurnKeysRef.current)) return;
+                if (data.sourceClientId === clientIdRef.current) pendingTurnProjectScopeRef.current = null;
                 showAgentError(data.message, data, !data.replayed);
             });
         });
@@ -558,6 +574,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 sending: false,
                 connectError: silent ? "" : text,
                 silentConnect: false,
+                fragmentBootstrap: false,
                 pendingTool: null,
                 pendingApprovals: [],
             });
@@ -628,6 +645,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         const selectedSkill = skillState.selectedSkill;
         const selectedSkillRevision = skillState.selectionRevision;
         const currentState = useAgentStore.getState();
+        const requestProjectScope = { projectId: currentState.canvasContext?.snapshot.projectId || "", revision: canvasProjectRevisionRef.current };
         const canvasNodeIds = new Set(currentState.canvasContext?.snapshot.nodes.map((node) => node.id) || []);
         const canvasReferences = currentState.canvasReferences.filter((item) => canvasNodeIds.has(item.nodeId));
         if (canvasReferences.length !== currentState.canvasReferences.length) {
@@ -681,6 +699,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const modelName = models.find((item) => item.model === model)?.displayName || model || rt("defaultModel");
             const effortName = reasoningEffort ? i18n.t(`agent.composer.effort.${reasoningEffort}`) : rt("defaultEffort");
             addEventLog(rt("sendTask"), `${modelName} · ${effortName}${selectedSkill ? ` · Skill ${selectedSkill.name}` : ""}${files.length ? ` · ${rt("attachmentCount", { count: files.length })}` : ""}${canvasReferences.length ? ` · ${rt("canvasReferenceCount", { count: canvasReferences.length })}` : ""} · ${compactText(text) || rt(canvasReferences.length ? "canvasReferencesOnly" : "attachmentsOnly")}`);
+            pendingTurnProjectScopeRef.current = requestProjectScope;
             const accepted = await fetchAgentJson<AgentTurnResponse>(endpoint, token, "/agent/codex/turn", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
@@ -708,6 +727,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 attachmentUrlsRef.current.delete(item.url);
             });
         } catch (error) {
+            pendingTurnProjectScopeRef.current = null;
             const text = error instanceof Error ? error.message : rt("sendFailed");
             const response = error instanceof AgentApiError ? error.response as { code?: string; state?: AgentConversationState } : undefined;
             if (response?.state) applyConversationState(response.state);
@@ -789,7 +809,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const handleToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
         if (confirmToolsRef.current && isCanvasWriteTool(payload.name)) {
             if (pendingToolRef.current) {
-                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error: rt("pendingCanvasTool") });
+                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, error: rt("pendingCanvasTool") });
                 return;
             }
             pendingToolRef.current = payload;
@@ -801,15 +821,19 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     };
 
     const runToolCall = async (endpoint: string, token: string, payload: AgentPendingToolCall) => {
+        if (!isExecutableToolCall(payload)) {
+            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, error: rt("canvasToolProjectChanged") }).catch(() => undefined);
+            return;
+        }
         if (isSiteTool(payload.name)) {
             try {
                 addEventLog(toolName(payload.name), payload, payload);
                 const result = await runSiteTool(payload.name, payload.input || {}, navigate, { canvasSnapshot: canvasContextRef.current?.snapshot || null });
-                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, result });
+                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, result });
                 addEventLog(rt("toolCompleted", { tool: toolName(payload.name) }), result, result);
             } catch (error) {
                 const message = error instanceof Error ? error.message : rt("toolExecutionFailed");
-                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error: message });
+                await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, error: message });
             }
             return;
         }
@@ -828,9 +852,13 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 result = context.applyOps(appliedOps);
                 void postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
             } else if (payload.name === "canvas_create_attachment_nodes") {
-                const context = canvasContextRef.current;
-                if (!context) throw new Error(rt("openCanvasFirst"));
+                if (!canvasContextRef.current) throw new Error(rt("openCanvasFirst"));
                 appliedOps = await attachmentNodeOps(endpoint, token, clientIdRef.current, payload.input?.nodes);
+                const context = canvasContextRef.current;
+                if (!context || !isExecutableToolCall(payload)) {
+                    await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, error: rt("canvasToolProjectChanged") }).catch(() => undefined);
+                    return;
+                }
                 result = context.applyOps(appliedOps);
                 await postState(endpoint, token, clientIdRef.current, result as CanvasAgentSnapshot);
             } else {
@@ -838,17 +866,20 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 if (!snapshot) throw new Error(rt("openCanvasFirst"));
                 result = snapshot;
             }
-            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, result });
+            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, result });
             addEventLog(rt("toolCompleted", { tool: toolName(payload.name) }), result, result);
         } catch (error) {
             const message = error instanceof Error ? error.message : rt("canvasOperationFailed");
-            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, error: message });
+            await postToolResult(endpoint, token, clientIdRef.current, { requestId: payload.requestId, projectId: payload.projectId, error: message });
         }
     };
 
+    const isExecutableToolCall = (payload: AgentPendingToolCall) => isCurrentToolCall(payload, clientIdRef.current)
+        && (payload.clientProjectRevision === undefined || payload.clientProjectRevision === canvasProjectRevisionRef.current);
+
     const rejectPendingTool = async () => {
         if (!pendingTool) return;
-        await postToolResult(endpoint, token, clientIdRef.current, { requestId: pendingTool.requestId, error: rt("canvasToolCanceled") });
+        await postToolResult(endpoint, token, clientIdRef.current, { requestId: pendingTool.requestId, projectId: pendingTool.projectId, error: rt("canvasToolCanceled") });
         pendingToolRef.current = null;
         setAgentState({ pendingTool: null });
     };
@@ -938,8 +969,29 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             return;
         }
         errorLoggedRef.current = false;
-        setAgentState({ url: nextEndpoint, token: nextToken, enabled: true, connected: false, silentConnect: silent, activity: rt("connecting"), connectError: "", activeTab: "setup" });
+        setAgentState({ url: nextEndpoint, token: nextToken, enabled: true, connected: false, silentConnect: silent, fragmentBootstrap: false, activity: rt("connecting"), connectError: "", activeTab: "setup" });
     };
+
+    useLayoutEffect(() => {
+        const bootstrap = readAgentUrlBootstrap(hash);
+        if (!bootstrap) return;
+        navigate(`${window.location.pathname}${window.location.search}${bootstrap.remainingHash}`, { replace: true });
+        if (!bootstrap.url || !bootstrap.token) {
+            setAgentState({ fragmentBootstrap: false, activeTab: "setup", connectError: rt(!bootstrap.url ? "addressRequired" : "agentNotFound") });
+            useAgentStore.getState().openPanel();
+            return;
+        }
+        try {
+            const parsed = new URL(bootstrap.url);
+            if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid protocol");
+        } catch {
+            setAgentState({ fragmentBootstrap: false, activeTab: "setup", connectError: rt("invalidAddress") });
+            useAgentStore.getState().openPanel();
+            return;
+        }
+        errorLoggedRef.current = false;
+        setAgentState({ url: bootstrap.url.replace(/\/$/, ""), token: bootstrap.token, enabled: true, connected: false, silentConnect: true, fragmentBootstrap: true, confirmTools: false, activity: rt("connecting"), connectError: "", activeTab: "setup" });
+    }, [hash, navigate, setAgentState]);
 
     useEffect(() => {
         if (urlAgentAutoConnect && confirmTools) setAgentState({ confirmTools: false });
@@ -956,6 +1008,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         threadMessagesRef.current.clear();
         authoritativeHistoryTurnsRef.current.clear();
         liveTurnKeysRef.current.clear();
+        pendingTurnProjectScopeRef.current = null;
+        turnProjectScopesRef.current.clear();
         threadOperationRef.current = 0;
         setAgentState({
             messages: [],
@@ -967,6 +1021,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             loadingThreads: false,
             waiting: false,
             sending: false,
+            fragmentBootstrap: false,
             pendingTool: null,
             pendingApprovals: [],
             conversation: { revision: 0, conversationId: "", threadId: "", status: "idle", mcpStatuses: {} },
@@ -1000,6 +1055,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         try {
             const result = await fetchAgentJson<AgentWorkspaceResponse>(endpoint, token, "/agent/codex/threads/reset", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clientId: clientIdRef.current, permissionMode }) });
             if (threadOperationRef.current !== operation) return;
+            pendingTurnProjectScopeRef.current = null;
+            turnProjectScopesRef.current.clear();
             if (result.conversation) applyConversationState(result.conversation);
             setAgentState({ activeTab: "chat", activity: rt("newConversation") });
         } catch (error) {
@@ -1019,6 +1076,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         const operation = beginThreadOperation();
         try {
             const result = await fetchAgentJson<AgentThreadResponse>(endpoint, token, `/agent/codex/threads/${encodeURIComponent(threadId)}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ permissionMode, clientId: clientIdRef.current }) });
+            pendingTurnProjectScopeRef.current = null;
+            turnProjectScopesRef.current.clear();
             if (result.conversation) applyConversationState(result.conversation);
             await loadThreads();
             if (useAgentStore.getState().activeThreadId === threadId) setAgentState({ activeTab: "chat", activity: rt("conversationResumed") });
@@ -1177,7 +1236,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         if (log) addEventLog(rt("processingFailed"), error.text, value);
     };
 
-    const handleAgentEvent = async (event: AgentEventPayload) => {
+    const handleAgentEvent = async (event: AgentEventPayload, isCurrentConnection: () => boolean) => {
         if (event.type === "usage.updated") setAgentState({ tokenUsage: eventUsage(event) });
         const log = event.replayed ? null : formatAgentEventLog(event);
         const activity = formatAgentActivity(event);
@@ -1186,7 +1245,12 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             const scope = eventScope(event);
             const current = useAgentStore.getState();
             if (!scope.threadId || !scope.turnId) return;
-            liveTurnKeysRef.current.add(`${scope.threadId}\0${scope.turnId}`);
+            const turnKey = `${scope.threadId}\0${scope.turnId}`;
+            liveTurnKeysRef.current.add(turnKey);
+            if (!event.replayed && event.sourceClientId === clientIdRef.current && pendingTurnProjectScopeRef.current) {
+                turnProjectScopesRef.current.set(turnKey, pendingTurnProjectScopeRef.current);
+                pendingTurnProjectScopeRef.current = null;
+            }
             setAgentState({ activeTurnId: scope.turnId, bootstrapStatus: null, mcpStartupStatuses: {}, messages: bindPendingTurnMessages(current.messages, scope.threadId, scope.turnId) });
         }
         if (event.type === "item.updated" && event.item?.type === "agent_message" && event.item.id) {
@@ -1228,28 +1292,43 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             setAgentState({ messages: useAgentStore.getState().messages.filter((item) => item.id !== id) });
             return;
         }
-        if (!event.replayed && event.type === "item.completed" && event.item?.type === "image_generation" && event.item.id && event.sourceClientId === clientIdRef.current) {
-            const generated = await importGeneratedImages(endpoint, token, event.item);
-            if (generated.length) {
-                const context = canvasContextRef.current;
-                if (context) {
-                    const right = Math.max(0, ...context.snapshot.nodes.map((node) => node.position.x + node.width)) + 80;
-                    const ops = generated.map<CanvasAgentOp>((image, index) => {
-                        const size = fitNodeSize(image.upload.width, image.upload.height);
-                        return {
-                            type: "add_node",
-                            id: `image-${createId()}`,
-                            nodeType: "image",
-                            title: image.name,
-                            position: { x: right + index * 40, y: index * 40 },
-                            ...size,
-                            metadata: imageMetadata(image.upload),
-                        };
-                    });
-                    const result = context.applyOps(ops);
-                    void postState(endpoint, token, clientIdRef.current, result);
+        if (!event.replayed && event.agent === "codex" && event.type === "item.completed" && event.item?.type === "image_generation" && event.item.id && isSuccessfulImageGeneration(event.item) && event.sourceClientId === clientIdRef.current) {
+            const scope = eventScope(event);
+            const projectScope = turnProjectScopesRef.current.get(`${scope.threadId}\0${scope.turnId}`);
+            const contextBeforeImport = canvasContextRef.current;
+            if (!projectScope?.projectId
+                || contextBeforeImport?.snapshot.projectId !== projectScope.projectId
+                || canvasProjectRevisionRef.current !== projectScope.revision) {
+                addEventLog(rt("importGeneratedImages"), rt("imageGenerated"));
+            } else {
+                const imported = await importGeneratedImages(endpoint, token, event.item, { clientId: clientIdRef.current, ...scope, itemId: event.item.id });
+                if (!isCurrentConnection() || !connectedRef.current || !isCurrentThreadEvent(event)) return;
+                const generated = imported.images;
+                if (generated.length) {
+                    const context = canvasContextRef.current;
+                    const belongsToSourceCanvas = Boolean(context
+                        && context.snapshot.projectId === projectScope.projectId
+                        && canvasProjectRevisionRef.current === projectScope.revision);
+                    if (context && belongsToSourceCanvas) {
+                        const right = Math.max(0, ...context.snapshot.nodes.map((node) => node.position.x + node.width)) + 80;
+                        const ops = generated.map<CanvasAgentOp>((image, index) => {
+                            const size = fitNodeSize(image.upload.width, image.upload.height);
+                            return {
+                                type: "add_node",
+                                id: `image-${createId()}`,
+                                nodeType: "image",
+                                title: image.name,
+                                position: { x: right + index * 40, y: index * 40 },
+                                ...size,
+                                metadata: imageMetadata(image.upload),
+                            };
+                        });
+                        const result = context.applyOps(ops);
+                        void postState(endpoint, token, clientIdRef.current, result);
+                    }
+                    addEventLog(rt("importGeneratedImages"), rt(belongsToSourceCanvas ? "addedToSourceCanvas" : "imageGenerated"));
                 }
-                addEventLog(rt("importGeneratedImages"), rt(context ? "addedToSourceCanvas" : "imageGenerated"));
+                if (imported.failed) addEventLog(rt("importGeneratedImages"), rt("generatedImageReadFailed"));
             }
         }
         if (activity && event.item?.id) {
@@ -1268,6 +1347,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 messages: current.messages.map((message) => message.threadId === scope.threadId && message.turnId === scope.turnId && message.streamId ? { ...message, streamId: undefined } : message),
             });
             if (event.status === "failed") showAgentError(event.error?.message, event, !event.replayed);
+            if (event.sourceClientId === clientIdRef.current) pendingTurnProjectScopeRef.current = null;
+            if (scope.threadId && scope.turnId) turnProjectScopesRef.current.delete(`${scope.threadId}\0${scope.turnId}`);
         }
         const item = formatAgentEvent(event);
         if (item) addMessage(scopeEventChatItem(event, { ...item, id: event.item?.id || createId() }, event.item?.id || createId()));
@@ -1499,7 +1580,7 @@ async function attachmentNodeOps(endpoint: string, token: string, clientId: stri
             const id = String(item.id || "");
             const attachmentId = String(item.attachmentId || "");
             if (!id || !attachmentId) throw new Error(rt("invalidAttachmentNode"));
-            const res = await fetch(`${endpoint}/agent/attachments/${encodeURIComponent(attachmentId)}?token=${encodeURIComponent(token)}&clientId=${encodeURIComponent(clientId)}`);
+            const res = await fetch(`${endpoint}/agent/attachments/${encodeURIComponent(attachmentId)}?clientId=${encodeURIComponent(clientId)}`, { headers: { "x-canvas-agent-token": token } });
             if (!res.ok) {
                 const body = (await res.json().catch(() => null)) as { error?: string } | null;
                 throw new Error(body?.error || rt("attachmentReadFailed"));
@@ -1536,31 +1617,37 @@ function clamp(value: number, min: number, max: number) {
     return Math.min(max, Math.max(min, value));
 }
 
-async function importGeneratedImages(endpoint: string, token: string, item: AgentEventItem) {
-    const sources = Array.from(generatedImageSources(item));
-    return await Promise.all(
-        sources.map(async (source, index) => {
-            const response = source.startsWith("data:image/")
-                ? await fetch(source)
-                : await fetch(`${endpoint}/agent/local-image?token=${encodeURIComponent(token)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: source }) });
-            if (!response.ok) throw new Error(rt("generatedImageReadFailed"));
-            const blob = await response.blob();
+type GeneratedImageGrantScope = { clientId: string; threadId: string; turnId: string; itemId: string };
+
+async function importGeneratedImages(endpoint: string, token: string, item: AgentEventItem, scope: GeneratedImageGrantScope) {
+    const result = await importGeneratedImageSources(
+        item.savedPath,
+        (source) => fetchGeneratedImageBlob(endpoint, token, source, scope),
+        async (blob, source, index) => {
             const upload = await uploadImage(blob);
-            const dataUrl = await readDataUrl(blob);
-            const name = source.startsWith("/") ? source.split("/").at(-1) || rt("generatedImageName", { index: index + 1 }) : rt("generatedImageName", { index: index + 1 });
-            return { upload, name, attachment: { id: createId(), name, type: blob.type || upload.mimeType, size: blob.size, width: upload.width, height: upload.height, url: upload.url, dataUrl } };
-        }),
+            const name = generatedImageFileName(source) || rt("generatedImageName", { index: index + 1 });
+            return { upload, name };
+        },
     );
+    return { images: result.items, failed: result.failed };
 }
 
-function generatedImageSources(value: unknown, result = new Set<string>()) {
-    if (typeof value === "string") {
-        if (value.startsWith("data:image/") || (/^\/.+\.(?:avif|gif|jpe?g|png|webp)$/i.test(value) && !value.includes("\n"))) result.add(value);
-        return result;
+const GENERATED_IMAGE_READ_TIMEOUT_MS = 60_000;
+
+async function fetchGeneratedImageBlob(endpoint: string, token: string, source: string, scope: GeneratedImageGrantScope) {
+    if (source.startsWith("data:image/")) {
+        if (source.length > Math.ceil(GENERATED_IMAGE_MAX_BYTES * 4 / 3) + 1024) throw new Error(rt("generatedImageReadFailed"));
+        return await (await fetch(source)).blob();
     }
-    if (Array.isArray(value)) value.forEach((item) => generatedImageSources(item, result));
-    else if (value && typeof value === "object") Object.values(value).forEach((item) => generatedImageSources(item, result));
-    return result;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), GENERATED_IMAGE_READ_TIMEOUT_MS);
+    try {
+        const response = await fetch(`${endpoint}/agent/local-image`, { method: "POST", headers: { "content-type": "application/json", "x-canvas-agent-token": token }, body: JSON.stringify({ path: source, ...scope }), signal: controller.signal });
+        if (!response.ok) throw new Error(rt("generatedImageReadFailed"));
+        return await response.blob();
+    } finally {
+        window.clearTimeout(timeout);
+    }
 }
 
 function readDataUrl(file: Blob) {

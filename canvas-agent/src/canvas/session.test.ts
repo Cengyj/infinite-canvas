@@ -58,7 +58,24 @@ test("画布写操作只发送给当前激活网页", async (t) => {
     const call = second.event("tool_call");
     assert.equal(first.event("tool_call"), undefined);
     assert.equal(field(call, "name"), "canvas_apply_ops");
-    session.resolveResult("second", { requestId: String(field(call, "requestId")), result: { ok: true } });
+    assert.equal(field(call, "projectId"), "canvas-second");
+    session.resolveResult("second", { requestId: String(field(call, "requestId")), projectId: "canvas-second", result: { ok: true } });
+    assert.deepEqual(await result, { ok: true });
+});
+
+test("工具调用携带当前线程、turn 和发起网页身份", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.bindClient("first");
+    session.setCodexState({ busy: true, threadId: "thread-1", turnId: "turn-1" });
+
+    const result = session.callTool("canvas_create_text_node", { text: "scoped" });
+    const call = first.event("tool_call") as Record<string, unknown>;
+    assert.equal(call.threadId, "thread-1");
+    assert.equal(call.turnId, "turn-1");
+    assert.equal(call.sourceClientId, "first");
+    session.resolveResult("first", { requestId: String(call.requestId), result: { ok: true } });
     assert.deepEqual(await result, { ok: true });
 });
 
@@ -126,6 +143,35 @@ test("tool result is accepted only from the request client", async (t) => {
     assert.equal(session.resolveResult("second", { requestId, result: { client: "second" } }), false);
     assert.equal(session.resolveResult("first", { requestId, result: { client: "first" } }), true);
     assert.deepEqual(await result, { client: "first" });
+});
+
+test("tool result is accepted only for the project that received the call", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.updateState(snapshot("canvas-first"), "first");
+
+    const result = session.callTool("canvas_create_text_node", { text: "first project only" });
+    const call = first.event("tool_call");
+    const requestId = String(field(call, "requestId"));
+
+    assert.equal(session.resolveResult("first", { requestId, projectId: "canvas-second", result: { ok: true } }), false);
+    assert.equal(session.resolveResult("first", { requestId, projectId: "canvas-first", result: { ok: true } }), true);
+    assert.deepEqual(await result, { ok: true });
+});
+
+test("switching projects rejects pending tool calls before a stale result can apply", async (t) => {
+    const session = new CanvasSession();
+    const first = connect(session, "first");
+    t.after(() => first.close());
+    session.updateState(snapshot("canvas-first"), "first");
+
+    const result = session.callTool("canvas_create_text_node", { text: "stale" });
+    const requestId = String(field(first.event("tool_call"), "requestId"));
+    session.updateState(snapshot("canvas-second"), "first");
+
+    await assert.rejects(result, /项目已切换/);
+    assert.equal(session.resolveResult("first", { requestId, projectId: "canvas-first", result: { ok: true } }), false);
 });
 
 test("生成状态查询由当前激活网页返回", async (t) => {
@@ -221,7 +267,7 @@ test("new clients receive the current Codex state and later updates", (t) => {
     t.after(() => client.close());
 
     const hello = client.event("hello");
-    assert.equal(field(hello, "protocolVersion"), 6);
+    assert.equal(field(hello, "protocolVersion"), 7);
     assert.deepEqual(field(hello, "workspace"), { activeThreadId: "thread-2" });
     assert.deepEqual(field(hello, "conversation"), { revision: 1, conversationId: "thread-2", threadId: "thread-2", status: "ready", mcpStatuses: {} });
     assert.deepEqual(field(hello, "codex"), { busy: true, threadId: "thread-2", turnId: "turn-1" });
@@ -349,7 +395,7 @@ test("a bound client remains the tool target while focus changes", async (t) => 
     const result = session.callTool("canvas_create_text_node", { text: "bound" });
     const call = first.event("tool_call");
     assert.equal(second.event("tool_call"), undefined);
-    session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true } });
+    session.resolveResult("first", { requestId: String(field(call, "requestId")), projectId: "canvas-first", result: { ok: true } });
     assert.deepEqual(await result, { ok: true });
 
     session.releaseClient("first");
@@ -381,7 +427,7 @@ test("a disconnected bound client never falls back and can resume with the same 
     const result = session.callTool("canvas_create_text_node", { text: "reconnected" });
     const call = reconnected.event("tool_call");
     assert.equal(second.event("tool_call"), undefined);
-    session.resolveResult("first", { requestId: String(field(call, "requestId")), result: { ok: true } });
+    session.resolveResult("first", { requestId: String(field(call, "requestId")), projectId: "canvas-first-reconnected", result: { ok: true } });
     assert.deepEqual(await result, { ok: true });
 });
 
@@ -396,6 +442,24 @@ test("新连接会回放当前运行 turn 的最新事件快照", (t) => {
 
     assert.deepEqual(client.events("chat_message"), [{ threadId: "thread-1", turnId: "turn-1", message: { id: "thread-1:turn-1:synthetic:user", itemId: "synthetic:user", clientMessageId: "local-message-1", role: "user", text: "问题" }, replayed: true }]);
     assert.deepEqual(client.events("agent_event"), [{ threadId: "thread-1", turnId: "turn-1", type: "item.updated", item: { id: "reasoning-1", type: "reasoning", text: "分析中" }, replayed: true }]);
+});
+
+test("相同 turn/item ID 在不同线程中分别回放且不会互相覆盖", (t) => {
+    const session = new CanvasSession();
+    session.setCodexState({ busy: true, threadId: "thread-1", turnId: "turn-1" });
+    session.emitThread("agent_event", "thread-1", { turnId: "turn-1", type: "item.updated", item: { id: "assistant", type: "agent_message", text: "线程一" } });
+    session.setCodexState({ busy: true, threadId: "thread-2", turnId: "turn-1" }, { preserveReplay: true });
+    session.emitThread("agent_event", "thread-2", { turnId: "turn-1", type: "item.updated", item: { id: "assistant", type: "agent_message", text: "线程二" } });
+
+    session.setCodexState({ threadId: "thread-1", turnId: "turn-1" }, { preserveReplay: true });
+    const first = connect(session, "first", "thread-1");
+    t.after(() => first.close());
+    assert.deepEqual((first.events("agent_event") as Array<Record<string, unknown>>).map((event) => field(field(event, "item"), "text")), ["线程一"]);
+
+    session.setCodexState({ threadId: "thread-2", turnId: "turn-1" }, { preserveReplay: true });
+    const second = connect(session, "second", "thread-2");
+    t.after(() => second.close());
+    assert.deepEqual((second.events("agent_event") as Array<Record<string, unknown>>).map((event) => field(field(event, "item"), "text")), ["线程二"]);
 });
 
 test("同一 item 的多次增量只回放最新内容", (t) => {
@@ -528,6 +592,18 @@ test("切换活动线程会清除上一线程的实时快照", (t) => {
     const client = connect(session, "first", "thread-1");
     t.after(() => client.close());
     assert.deepEqual(client.events("agent_event"), []);
+});
+
+test("相同 turn 和 item id 的重放事件仍按线程隔离", (t) => {
+    const session = new CanvasSession();
+    session.setCodexState({ busy: true, threadId: "thread-1", turnId: "turn-1" });
+    session.emitThread("agent_event", "thread-1", { turnId: "turn-1", type: "item.updated", item: { id: "assistant", type: "agent_message", text: "线程一" } });
+    session.emitThread("agent_event", "thread-2", { turnId: "turn-1", type: "item.updated", item: { id: "assistant", type: "agent_message", text: "线程二" } });
+
+    const first = connect(session, "first", "thread-1");
+    t.after(() => first.close());
+    const events = first.events("agent_event") as Array<Record<string, unknown>>;
+    assert.deepEqual(events.map((event) => field(field(event, "item"), "text")), ["线程一"]);
 });
 
 /** 创建用于测试的画布 SSE 连接。 */

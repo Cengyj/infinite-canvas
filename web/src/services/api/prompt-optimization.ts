@@ -10,6 +10,7 @@ export type PromptOptimizationScenario = "image" | "video";
 
 export type PromptOptimizationContext = {
     generationMode?: "text-to-video" | "image-to-video";
+    referenceMode?: "frames" | "reference";
     durationSeconds?: string;
     frameSize?: string;
     audioEnabled?: boolean;
@@ -28,6 +29,7 @@ export type PromptOptimizationInput = {
 export const MAX_PROMPT_OPTIMIZATION_REFERENCES = 4;
 const MAX_REFERENCE_EDGE = 1600;
 const MAX_REFERENCE_BYTES = 3 * 1024 * 1024;
+const REFERENCE_DECODE_TIMEOUT_MS = 10_000;
 // Four 3 MB images expand to about 16 MB as base64, leaving request headroom below Gemini's 20 MB inline limit.
 const MAX_REFERENCE_TOTAL_BYTES = 12 * 1024 * 1024;
 
@@ -143,7 +145,7 @@ async function resolveReferenceImages(references: ReferenceImage[], signal?: Abo
 }
 
 async function prepareReferenceImage(reference: ReferenceImage, signal?: AbortSignal) {
-    const dataUrl = await imageToDataUrl(reference, signal);
+    const dataUrl = await imageToDataUrl(reference, { signal });
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const mimeType = dataUrl.match(/^data:(image\/[\w.+-]+);base64,/i)?.[1].toLowerCase();
     if (!mimeType) throw new Error();
@@ -160,28 +162,33 @@ async function prepareReferenceImage(reference: ReferenceImage, signal?: AbortSi
 function loadReferenceImage(dataUrl: string, signal?: AbortSignal) {
     return new Promise<HTMLImageElement>((resolve, reject) => {
         const image = new Image();
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const cleanup = () => {
+            clearTimeout(timer);
             image.onload = null;
             image.onerror = null;
             signal?.removeEventListener("abort", abort);
         };
-        const abort = () => {
+        const fail = (error: Error) => {
             cleanup();
             image.src = "";
-            reject(new DOMException("Aborted", "AbortError"));
+            reject(error);
         };
+        const abort = () => fail(new DOMException("Aborted", "AbortError"));
         if (signal?.aborted) {
             abort();
             return;
         }
         image.onload = () => {
+            if (!image.naturalWidth || !image.naturalHeight) {
+                fail(new Error());
+                return;
+            }
             cleanup();
             resolve(image);
         };
-        image.onerror = () => {
-            cleanup();
-            reject(new Error());
-        };
+        image.onerror = () => fail(new Error());
+        timer = setTimeout(() => fail(new Error()), REFERENCE_DECODE_TIMEOUT_MS);
         signal?.addEventListener("abort", abort, { once: true });
         image.src = dataUrl;
     });

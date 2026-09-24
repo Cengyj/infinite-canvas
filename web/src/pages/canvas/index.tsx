@@ -6,13 +6,15 @@ import { useTranslation } from "react-i18next";
 
 import { readZip } from "@/lib/zip";
 import { setMediaBlob } from "@/services/file-storage";
-import { createImageStorageLease, setImageBlob } from "@/services/image-storage";
+import { setImageBlob } from "@/services/image-storage";
+import { retainMediaReferences } from "@/services/media-references";
 import { CanvasDeleteProjectsDialog } from "@/components/canvas/canvas-delete-projects-dialog";
 import { CanvasProjectCard } from "@/components/canvas/canvas-project-card";
 import type { CanvasExportFile } from "@/types/canvas-export";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useCanvasUiStore } from "@/stores/canvas/use-canvas-ui-store";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
+import { hasAgentUrlBootstrap } from "@/lib/agent/agent-url-bootstrap";
 
 export default function CanvasPage() {
     const { message } = App.useApp();
@@ -32,7 +34,8 @@ export default function CanvasPage() {
     const agentMode = mode === "new" || mode === "recent" || mode === "choose";
     const agentQuery = agentMode ? `?${searchParams.toString()}` : "";
     const enterProject = (id: string) => {
-        navigate(`/canvas/${id}${agentQuery}`);
+        const agentHash = hasAgentUrlBootstrap(window.location.hash) ? window.location.hash : "";
+        navigate(`/canvas/${id}${agentQuery}${agentHash}`, { replace: Boolean(agentHash) });
     };
     const createAndEnter = () => enterProject(createProject(t("canvas.defaultTitle", { count: projects.length + 1 })));
     const importCanvas = async (file?: File) => {
@@ -42,22 +45,22 @@ export default function CanvasPage() {
             const projectFile = zip.get("projects.json");
             if (!projectFile) throw new Error("missing projects.json");
             const data = JSON.parse(await projectFile.text()) as CanvasExportFile;
-            const lease = createImageStorageLease(data.projects.flatMap((project) => project.files.flatMap((item) => (item.storageKey.startsWith("image:") ? [item.storageKey] : []))));
+            const releaseReferences = retainMediaReferences(() => data.projects);
             try {
-                await Promise.all(
-                    data.projects.flatMap((project) =>
-                        project.files.map(async (item) => {
-                            const blob = zip.get(item.path);
-                            if (!blob) return;
-                            const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
-                            await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
-                        }),
-                    ),
+                const writes = await Promise.allSettled(
+                    data.projects.flatMap((project) => project.files.map(async (item) => {
+                        const blob = zip.get(item.path);
+                        if (!blob) throw new Error(`Missing canvas file: ${item.path}`);
+                        const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
+                        await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
+                    })),
                 );
+                const failed = writes.find((result) => result.status === "rejected");
+                if (failed?.status === "rejected") throw failed.reason;
                 data.projects.forEach((item) => importProject(item.project));
                 message.success(t("canvas.imported", { count: data.projects.length }));
             } finally {
-                lease.release();
+                releaseReferences();
             }
         } catch {
             message.error(t("canvas.importFailed"));

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
 import { AGENT_PROMPT } from "../config.js";
+import { createAgentLogWriter, redactAgentLog } from "../utils/agent-runtime.js";
 import { errorMessage } from "../utils/value.js";
 import type { AgentEmit } from "./types.js";
 
@@ -26,15 +27,22 @@ function pipeJsonLines(child: ReturnType<typeof spawn>, emit: AgentEmit, agent: 
         out = lines.pop() || "";
         lines.filter(Boolean).forEach((line) => {
             try {
-                emit("agent_event", { agent, ...JSON.parse(line) });
+                emit("agent_event", { ...JSON.parse(line), agent });
             } catch {
                 emit("agent_event", { agent, type: "raw", text: line });
             }
         });
     });
-    child.stderr?.on("data", (chunk) => emit("agent_log", { text: chunk.toString() }));
-    child.on("error", (error) => emit("agent_error", { message: error.message }));
-    child.on("close", (code) => emit("agent_done", { agent, code }));
+    const logWriter = createAgentLogWriter((text) => emit("agent_log", { text }));
+    child.stderr?.on("data", (chunk) => logWriter.write(chunk.toString()));
+    child.on("error", (error) => {
+        logWriter.flush();
+        emit("agent_error", { message: redactAgentLog(error.message) });
+    });
+    child.on("close", (code) => {
+        logWriter.flush();
+        emit("agent_done", { agent, code });
+    });
 }
 
 /** 启动外部 Agent CLI，并将同步启动异常转换为事件。 */
@@ -42,7 +50,7 @@ function spawnAgent(name: string, args: string[], emit: AgentEmit) {
     try {
         return spawn(name, args, { stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", windowsHide: true });
     } catch (error) {
-        emit("agent_error", { message: errorMessage(error) });
+        emit("agent_error", { message: redactAgentLog(errorMessage(error)) });
         return null;
     }
 }

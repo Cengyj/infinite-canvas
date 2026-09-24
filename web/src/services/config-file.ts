@@ -50,13 +50,16 @@ export async function importAppConfig(file: File) {
 
 function isAppConfigFile(value: unknown): value is ImportedAppConfigFile {
     if (!isRecord(value) || value.app !== "infinite-canvas" || value.version !== 1 || typeof value.exportedAt !== "string" || !isRecord(value.config) || !isRecord(value.webdav) || !isRecord(value.promptSources)) return false;
+    const config = value.config;
+    const webdav = value.webdav;
+    const promptSources = value.promptSources;
     const scalarConfigKeys = Object.keys(defaultConfig).filter((key) => key !== "channels" && key !== "models");
-    if (!scalarConfigKeys.every((key) => value.config[key] === undefined || typeof value.config[key] === "string")) return false;
-    if (value.config.models !== undefined && (!Array.isArray(value.config.models) || !value.config.models.every((model) => typeof model === "string"))) return false;
-    if (value.config.channels !== undefined && (!Array.isArray(value.config.channels) || !value.config.channels.every(isChannel))) return false;
-    if (!Object.keys(defaultWebdavSyncConfig).every((key) => value.webdav[key] === undefined || typeof value.webdav[key] === "string")) return false;
-    const sources = value.promptSources.sources;
-    const schedule = value.promptSources.schedule;
+    if (!scalarConfigKeys.every((key) => config[key] === undefined || typeof config[key] === typeof defaultConfig[key as keyof AiConfig])) return false;
+    if (config.models !== undefined && (!Array.isArray(config.models) || !config.models.every((model) => typeof model === "string"))) return false;
+    if (config.channels !== undefined && (!Array.isArray(config.channels) || !config.channels.every(isChannel))) return false;
+    if (!Object.keys(defaultWebdavSyncConfig).every((key) => webdav[key] === undefined || typeof webdav[key] === "string")) return false;
+    const sources = promptSources.sources;
+    const schedule = promptSources.schedule;
     return Array.isArray(sources) && sources.every(isPromptSource) && isRecord(schedule) && (schedule.intervalMinutes === undefined || (typeof schedule.intervalMinutes === "number" && Number.isFinite(schedule.intervalMinutes))) && (schedule.lastFetchedAt === undefined || typeof schedule.lastFetchedAt === "string");
 }
 

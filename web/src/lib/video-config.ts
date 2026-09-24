@@ -1,42 +1,38 @@
+import { clampVideoSeconds, computeVideoSize, parseVideoResolution } from "@/lib/media-size";
+
 export const VIDEO_POLL_INTERVAL_MS = 3000;
 export const VIDEO_POLL_TIMEOUT_MS = 20 * 60 * 1000;
+export const MAX_VIDEO_REFERENCE_IMAGES = 7;
 
-export function normalizeVideoSeconds(value: string) {
-    const seconds = Math.floor(Number(value) || 6);
-    return String(Math.max(1, Math.min(20, seconds)));
+export function isGrokVideoModel(model: string) {
+    return /^grok-imagine-video(?:$|-)/i.test(String(model || "").split("::").pop()!.trim());
 }
 
-export function normalizeVideoFrameSize(value: string) {
-    if (value === "auto") return "auto";
-    if (/^\d+x\d+$/.test(value || "")) return value;
-    return ["9:16", "2:3", "3:4"].includes(value) ? "720x1280" : "1280x720";
+export function normalizeVideoSeconds(value: string, model = "") {
+    if (!isGrokVideoModel(model)) return clampVideoSeconds(value);
+    return String(Math.max(1, Math.min(15, Math.floor(Number(value) || 6))));
 }
+export const normalizeVideoResolution = parseVideoResolution;
 
-export function normalizeVideoResolution(value: string) {
-    if (value === "480p" || value === "low") return "480";
-    if (value === "720p" || value === "auto" || value === "high" || value === "medium") return "720";
-    return value.replace(/p$/i, "") || "720";
+export function normalizeVideoFrameSize(value: string, resolution = "720") {
+    if (!value || value === "auto") return "auto";
+    if (/^\d+x\d+$/i.test(value)) return value.toLowerCase();
+    return computeVideoSize(resolution, normalizeVideoRatio(value) || "16:9");
 }
 
 export function normalizeVideoResolutionName(value: string) {
     return `${normalizeVideoResolution(value)}p`;
 }
 
-/** Return a canonical width:height ratio for model-call scripts. */
+/** Preserve the requested orientation and exact ratio for model scripts and results. */
 export function normalizeVideoRatio(value: string) {
-    const normalized = String(value || "").trim().toLowerCase();
-    if (!normalized || normalized === "auto" || normalized === "adaptive") return "";
-    const match = normalized.match(/^(\d+)\s*[x:]\s*(\d+)$/);
+    const match = String(value || "").trim().match(/^(\d+)\s*[x:]\s*(\d+)$/i);
     if (!match) return "";
     const width = Number(match[1]);
     const height = Number(match[2]);
     if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) return "";
     let a = width;
     let b = height;
-    while (b) {
-        const remainder = a % b;
-        a = b;
-        b = remainder;
-    }
+    while (b) [a, b] = [b, a % b];
     return `${width / a}:${height / a}`;
 }

@@ -8,7 +8,7 @@ import type { ToolName } from "./schemas.js";
 import { compactCanvasState, compactNode, isToolName, nextCanvasX, parseToolInput } from "./tools.js";
 import type { CanvasSnapshot } from "./types.js";
 
-type PendingRequest = { clientId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
+type PendingRequest = { clientId: string; projectId: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
 type TurnAttachment = { clientId: string; id: string; name: string; type: string; size: number; width: number; height: number; dataUrl: string };
 type ReplayEvent = { type: string; payload: Record<string, unknown> };
 export type CodexState = { busy: boolean; threadId: string; turnId: string };
@@ -23,7 +23,7 @@ export type ConversationState = {
     error?: string;
 };
 type McpInventoryItem = { name: string; authStatus?: string };
-export const AGENT_PROTOCOL_VERSION = 6;
+export const AGENT_PROTOCOL_VERSION = 7;
 
 const SITE_TOOLS = new Set<ToolName>([
     "site_navigate",
@@ -280,7 +280,12 @@ export class CanvasSession {
             }
         }
         sendEvent(res, "hello", { ok: true, protocolVersion: AGENT_PROTOCOL_VERSION, clientId, workspace: { activeThreadId }, conversation: this.conversationStateSnapshot, codex: this.codexState, pendingApprovals: this.codexPendingApprovals });
-        if (!statusOnly && activeThreadId && this.codexState.threadId === activeThreadId) this.codexReplayEvents.forEach((event) => sendEvent(res, event.type, event.payload));
+        if (!statusOnly && activeThreadId && this.codexState.threadId === activeThreadId) {
+            this.codexReplayEvents.forEach((event) => {
+                const eventThreadId = String(event.payload.threadId || event.payload.thread_id || "");
+                if (eventThreadId === activeThreadId) sendEvent(res, event.type, event.payload);
+            });
+        }
         const timer = setInterval(() => sendEvent(res, "ping", { time: Date.now() }), 15000);
         res.on("close", () => {
             clearInterval(timer);
@@ -311,6 +316,12 @@ export class CanvasSession {
         if (!targetClientId || !this.clients.has(targetClientId)) return;
         const state = { ...((body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>), clientId: targetClientId } as CanvasSnapshot;
         this.canvasStates.set(targetClientId, state);
+        const projectId = String(state.projectId || "");
+        this.pending.forEach((item, requestId) => {
+            if (item.clientId !== targetClientId || !item.projectId || item.projectId === projectId) return;
+            this.pending.delete(requestId);
+            item.reject(new Error("画布项目已切换，旧工具调用已取消"));
+        });
         logger.debug("Canvas state updated", { clientId: targetClientId, nodes: state.nodes?.length || 0, connections: state.connections?.length || 0 });
     }
 
@@ -372,11 +383,11 @@ export class CanvasSession {
     }
 
     /** 接收网页返回的工具调用结果。 */
-    resolveResult(clientId: string, body: { requestId?: string; error?: string; result?: unknown }) {
+    resolveResult(clientId: string, body: { requestId?: string; projectId?: string; error?: string; result?: unknown }) {
         const item = body.requestId ? this.pending.get(body.requestId) : null;
-        if (!item || !body.requestId || item.clientId !== clientId) return false;
+        if (!item || !body.requestId || item.clientId !== clientId || item.projectId && body.projectId !== item.projectId) return false;
         this.pending.delete(body.requestId);
-        logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: body.result });
+        logger.debug("Canvas tool result received", { clientId, requestId: body.requestId, error: body.error, result: summarizeLogValue(body.result) });
         body.error ? item.reject(new Error(body.error)) : item.resolve(body.result);
         return true;
     }
@@ -423,10 +434,6 @@ export class CanvasSession {
     }
 
     private clearReplayActiveTurn(threadId: string, turnId: string) {
-        const prefix = `item:${turnId}:`;
-        this.codexReplayActiveItems.forEach((key) => {
-            if (key.startsWith(prefix)) this.codexReplayActiveItems.delete(key);
-        });
         if (!turnId) return;
         this.codexReplayActiveItems.forEach((key) => {
             const event = this.codexReplayEvents.get(key);
@@ -439,7 +446,7 @@ export class CanvasSession {
     /** 校验工具参数并将调用分派到当前目标网页。 */
     async callTool(name: unknown, rawInput: unknown) {
         if (!isToolName(name)) throw new Error(`未知工具：${String(name)}`);
-        logger.info("MCP tool called", { name, input: rawInput, targetClientId: this.targetClientId });
+        logger.info("MCP tool called", { name, targetClientId: this.targetClientId, input: summarizeLogValue(rawInput) });
         const input = parseToolInput(name, rawInput) as Record<string, unknown>;
         if (SITE_TOOLS.has(name)) {
             if (!this.clients.size) throw new Error("当前没有已连接网页");
@@ -491,37 +498,53 @@ export class CanvasSession {
         const clientId = this.targetClientId;
         const client = this.clients.get(clientId);
         if (!client) throw new Error("当前没有已连接画布");
-        sendEvent(client, "tool_call", { requestId, name, input });
-        logger.debug("Canvas tool request sent", { requestId, name, input, clientId });
+        const projectId = String(this.canvasStates.get(clientId)?.projectId || "");
+        // Keep tool requests scoped to the turn that produced them.  The fields
+        // are optional on the wire so older clients can continue handling calls
+        // that originate outside a Codex turn.
+        const scope = this.codexEventScope;
+        sendEvent(client, "tool_call", {
+            requestId,
+            name,
+            input,
+            ...(scope.threadId ? { threadId: scope.threadId } : {}),
+            ...(scope.turnId ? { turnId: scope.turnId } : {}),
+            ...(clientId ? { sourceClientId: clientId } : {}),
+            ...(projectId ? { projectId } : {}),
+        });
+        logger.debug("Canvas tool request sent", { requestId, name, input: summarizeLogValue(input), clientId });
         return await new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(requestId);
                 logger.warn("Canvas tool request timed out", { requestId, name, clientId });
                 reject(new Error("画布操作超时"));
             }, 30000);
-            this.pending.set(requestId, { clientId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
+            this.pending.set(requestId, { clientId, projectId, resolve: (value) => (clearTimeout(timer), resolve(value)), reject: (error) => (clearTimeout(timer), reject(error)) });
         });
     }
 }
 
 /** 为运行中 turn 的可重放事件生成稳定键。 */
 function codexReplayKey(type: string, payload: Record<string, unknown>) {
+    const threadId = String(payload.threadId || payload.thread_id || "");
     const turnId = String(payload.turnId || payload.turn_id || "");
+    if (!threadId || !turnId) return "";
+    const scoped = (kind: string, itemId: string) => `${kind}:${threadId}\u0000${turnId}\u0000${itemId}`;
     if (type === "chat_message") {
         const message = recordValue(payload.message);
         const clientMessageId = String(message.clientMessageId || "");
-        if (clientMessageId) return `chat:${clientMessageId}`;
+        if (clientMessageId) return scoped("chat", clientMessageId);
         const messageId = String(message.itemId || message.id || "");
-        return messageId ? `chat:${turnId}:${messageId}` : "";
+        return messageId ? scoped("chat", messageId) : "";
     }
-    if (type === "agent_error") return `error:${turnId}`;
+    if (type === "agent_error") return scoped("error", "error");
     if (type !== "agent_event") return "";
     const item = recordValue(payload.item);
-    if (item.id) return `item:${turnId}:${String(item.id)}`;
+    if (item.id) return scoped("item", String(item.id));
     const eventType = String(payload.type || "");
-    if (eventType === "plan.updated") return `plan:${turnId}`;
-    if (eventType === "usage.updated") return `usage:${turnId}`;
-    if (eventType === "turn.completed" || eventType === "error") return `${eventType}:${turnId}`;
+    if (eventType === "plan.updated") return scoped("plan", "plan");
+    if (eventType === "usage.updated") return scoped("usage", "usage");
+    if (eventType === "turn.completed" || eventType === "error") return scoped(eventType, eventType);
     return "";
 }
 
@@ -537,4 +560,10 @@ function sendEvent(res: ServerResponse, type: string, payload: unknown) {
 function positiveNumber(value: unknown, fallback: number) {
     const number = Number(value);
     return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function summarizeLogValue(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { type: typeof value };
+    const record = value as Record<string, unknown>;
+    return { type: "object", keys: Object.keys(record).slice(0, 40), keyCount: Object.keys(record).length };
 }

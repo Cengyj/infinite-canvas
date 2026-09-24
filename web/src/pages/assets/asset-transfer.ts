@@ -1,8 +1,10 @@
 import { saveAs } from "file-saver";
+import { nanoid } from "nanoid";
 
 import { createZip, readZip } from "@/lib/zip";
-import { getMediaBlob, setMediaBlob } from "@/services/file-storage";
-import { createImageStorageLease, getImageBlob, setImageBlob } from "@/services/image-storage";
+import { deleteStoredMedia, getMediaBlob, setMediaBlob } from "@/services/file-storage";
+import { deleteStoredImages, getImageBlob, setImageBlob } from "@/services/image-storage";
+import { retainMediaReferences } from "@/services/media-references";
 import type { Asset } from "@/stores/use-asset-store";
 
 type AssetExportFile = {
@@ -47,19 +49,42 @@ export async function readAssetPackage(file: File) {
     const assetFile = zip.get("assets.json");
     if (!assetFile) throw new Error("missing assets.json");
     const data = JSON.parse(await assetFile.text()) as AssetExportFile;
-    const lease = createImageStorageLease(data.files.flatMap((item) => (item.storageKey.startsWith("image:") ? [item.storageKey] : [])));
+    const importedFiles = new Map<string, { storageKey: string; url: string }>();
+    const release = retainMediaReferences(() => Array.from(importedFiles.values()));
     try {
-        await Promise.all(
-            data.files.map(async (item) => {
+        const writes = await Promise.allSettled(
+            Array.from(new Map(data.files.map((item) => [item.storageKey, item])).values()).map(async (item) => {
                 const blob = zip.get(item.path);
-                if (!blob) return;
+                if (!blob) throw new Error(`Missing asset file: ${item.path}`);
                 const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
-                await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
+                const prefix = item.storageKey.split(":", 1)[0] || (item.mimeType.startsWith("image/") ? "image" : "file");
+                const imported = { storageKey: `${prefix}:${nanoid()}`, url: "" };
+                importedFiles.set(item.storageKey, imported);
+                imported.url = await (imported.storageKey.startsWith("image:") ? setImageBlob(imported.storageKey, typedBlob) : setMediaBlob(imported.storageKey, typedBlob));
             }),
         );
-        return { assets: data.assets, release: lease.release };
+        const failed = writes.find((result) => result.status === "rejected");
+        if (failed?.status === "rejected") throw failed.reason;
+        const assets = data.assets.map((asset) => {
+            if (asset.kind !== "image" && asset.kind !== "video") return asset;
+            const imported = asset.data.storageKey ? importedFiles.get(asset.data.storageKey) : undefined;
+            if (!imported) return asset;
+            if (asset.kind === "video") return { ...asset, coverUrl: asset.coverUrl.startsWith("blob:") ? "" : asset.coverUrl, data: { ...asset.data, storageKey: imported.storageKey, url: imported.url } };
+            const previousUrl = asset.data.dataUrl;
+            return {
+                ...asset,
+                coverUrl: !asset.coverUrl || asset.coverUrl === previousUrl || asset.coverUrl.startsWith("blob:") ? imported.url : asset.coverUrl,
+                data: { ...asset.data, storageKey: imported.storageKey, dataUrl: imported.url },
+            };
+        });
+        return { assets, release };
     } catch (error) {
-        lease.release();
+        const written = Array.from(importedFiles.values()).filter((item) => item.url);
+        await Promise.all([
+            deleteStoredImages(written.filter((item) => item.storageKey.startsWith("image:")).map((item) => item.storageKey)),
+            deleteStoredMedia(written.filter((item) => !item.storageKey.startsWith("image:")).map((item) => item.storageKey)),
+        ]).catch(() => undefined);
+        release();
         throw error;
     }
 }

@@ -1,5 +1,6 @@
 import i18n from "@/i18n";
-import type { WebdavSyncConfig } from "@/stores/use-config-store";
+import { isBrowserNetworkError, isOriginNotAllowedFetchResponse, networkFailureMessage } from "@/lib/network-errors";
+import { withLocalProxy, type WebdavSyncConfig } from "@/stores/use-config-store";
 
 export const WEBDAV_MANIFEST_FILE_NAME = "manifest.json";
 const WEBDAV_REQUEST_TIMEOUT_MS = 120000;
@@ -77,11 +78,20 @@ async function webdavFetch(config: WebdavSyncConfig, path: string, init: Request
     if (config.username || config.password) headers.set("Authorization", `Basic ${encodeBasicAuth(`${config.username}:${config.password}`)}`);
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), WEBDAV_REQUEST_TIMEOUT_MS);
+    const url = withLocalProxy(buildWebdavUrl(config, path));
     try {
-        const url = buildWebdavUrl(config, path);
-        return await fetch(url, { ...init, headers, signal: controller.signal });
+        const response = await fetch(url, { ...init, headers, signal: controller.signal });
+        if (await isOriginNotAllowedFetchResponse(response, url)) throw new Error(i18n.t("config.proxy.originNotAllowed"));
+        return response;
     } catch (error) {
         if (error instanceof Error && error.name === "AbortError") throw new Error(webdavText("requestTimeout"));
+        if (isBrowserNetworkError(error)) {
+            throw new Error(networkFailureMessage(error, url, {
+                cors: webdavText("connectionFailed"),
+                proxy: i18n.t("config.proxy.unreachable"),
+                fallback: webdavText("connectionFailed"),
+            }));
+        }
         if (error instanceof TypeError) throw new Error(webdavText("connectionFailed"));
         throw error;
     } finally {

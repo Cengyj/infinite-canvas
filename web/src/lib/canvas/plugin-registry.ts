@@ -1,3 +1,6 @@
+import i18n from "@/i18n";
+import { isAbortError, isBrowserNetworkError, isOriginNotAllowedFetchResponse, networkFailureMessage } from "@/lib/network-errors";
+import { withLocalProxy } from "@/stores/use-config-store";
 import { PLUGIN_REGISTRY_URL } from "@/constant/env";
 
 // An official registry item whose entry has been resolved to an absolute URL.
@@ -15,8 +18,25 @@ type RawManifest = { plugins?: RawEntry[] };
 
 // Fetch the official registry and resolve relative entries against its URL for the existing URL installation flow.
 export async function fetchOfficialPlugins(registryUrl: string = PLUGIN_REGISTRY_URL): Promise<OfficialPluginEntry[]> {
-    const response = await fetch(registryUrl, { headers: { accept: "application/json" } });
-    if (!response.ok) throw new Error(i18n.t("canvas.pluginErrors.registryFailed", { status: response.status }));
+    const requestUrl = withLocalProxy(registryUrl);
+    let response: Response;
+    try {
+        response = await fetch(requestUrl, { headers: { accept: "application/json" } });
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (isBrowserNetworkError(error)) {
+            throw new Error(networkFailureMessage(error, requestUrl, {
+                cors: i18n.t("apiErrors.corsRequired"),
+                proxy: i18n.t("config.proxy.unreachable"),
+                fallback: i18n.t("apiErrors.requestFailed"),
+            }));
+        }
+        throw error;
+    }
+    if (!response.ok) {
+        if (await isOriginNotAllowedFetchResponse(response, requestUrl)) throw new Error(i18n.t("config.proxy.originNotAllowed"));
+        throw new Error(i18n.t("canvas.pluginErrors.registryFailed", { status: response.status }));
+    }
     const data = (await response.json()) as RawManifest;
     const list = Array.isArray(data?.plugins) ? data.plugins : [];
     return list
@@ -47,4 +67,3 @@ function compareSemver(a: string, b: string): number {
 export function hasUpgrade(installedVersion: string, remoteVersion: string): boolean {
     return compareSemver(remoteVersion, installedVersion) > 0;
 }
-import i18n from "@/i18n";

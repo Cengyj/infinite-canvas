@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 
@@ -13,6 +13,7 @@ import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWo
 import { logger } from "../utils/logger.js";
 import { checkVersions } from "../version-check.js";
 import { SkillStore, SkillStoreError } from "../skills/store.js";
+import { claimLocalImageGrant, completeLocalImageGrant, isLocalImagePath, LOCAL_IMAGE_MAX_BYTES, localImageGrantKey, localImageGrantScope, registerLocalImageGrants, releaseLocalImageGrant, type LocalImageGrant } from "./local-image-grants.js";
 
 /** 启动仅监听本机的 Canvas Agent HTTP 服务。 */
 export function startHttpServer() {
@@ -24,6 +25,7 @@ export function startHttpServer() {
     const initialWorkspace = ensureSiteWorkspace(config);
     const session = new CanvasSession(initialWorkspace.activeThreadId || "");
     const skillStore = new SkillStore(initialWorkspace.workspacePath);
+    const localImageGrants = new Map<string, LocalImageGrant>();
     /** 将 Agent 事件广播到所属线程或全部网页。 */
     const emit = (type: string, payload: unknown) => {
         const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
@@ -48,6 +50,17 @@ export function startHttpServer() {
         session.trackCodexEvent(type, data);
         threadId ? session.emitThread(type, threadId, data) : session.emitAll(type, data);
     };
+    /** 仅接收 Codex app-server 的可信事件，用当前运行会话签发本地生图读取授权。 */
+    const codexEmit = (type: string, payload: unknown) => {
+        const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
+        const scope = session.codexEventScope;
+        const threadId = String(value.threadId || value.thread_id || "");
+        const turnId = String(value.turnId || value.turn_id || "");
+        if (threadId === scope.threadId && turnId === scope.turnId) {
+            registerLocalImageGrants(localImageGrants, type, value, { clientId: scope.sourceClientId, threadId: scope.threadId, turnId: scope.turnId });
+        }
+        emit(type, value);
+    };
     /** 保存并广播当前站点工作空间的活跃线程。 */
     const setActiveThread = (activeThreadId: string, payload: Record<string, unknown> = {}, preserveConversation = false) => {
         const workspace = updateSiteWorkspace(config, { activeThreadId: activeThreadId || undefined });
@@ -65,7 +78,7 @@ export function startHttpServer() {
         prepared = (async () => {
             emit("agent_bootstrap", { type: "codex.preparing", sourceClientId: clientId });
             try {
-                const thread = await startCodexThread(emit, workspace.workspacePath, permission, true);
+                const thread = await startCodexThread(codexEmit, workspace.workspacePath, permission, true);
                 if (draftThreadStart !== prepared) return thread;
                 const threadId = String((thread as Record<string, unknown>).id || "");
                 if (threadId && !ensureSiteWorkspace(config).activeThreadId) {
@@ -92,7 +105,7 @@ export function startHttpServer() {
         const workspace = ensureSiteWorkspace(config);
         session.beginConversation({ conversationId: threadId, threadId, sourceClientId: clientId || undefined });
         emit("agent_bootstrap", { type: "codex.preparing", threadId, sourceClientId: clientId || undefined });
-        const result = await resumeCodexThread(emit, threadId, workspace.workspacePath, permission, true);
+        const result = await resumeCodexThread(codexEmit, threadId, workspace.workspacePath, permission, true);
         session.completeConversationPreparation(threadId);
         return result;
     };
@@ -163,21 +176,51 @@ export function startHttpServer() {
     }));
     app.post("/agent/local-image", route(async (req, res) => {
         const filePath = String(req.body?.path || "");
-        if (!path.isAbsolute(filePath) || !/\.(?:avif|gif|jpe?g|png|webp)$/i.test(filePath)) return res.status(400).json({ ok: false, error: "图片路径无效" });
-        const file = await stat(filePath);
-        if (!file.isFile()) return res.status(400).json({ ok: false, error: "图片文件无效" });
+        if (!isLocalImagePath(filePath)) return res.status(400).json({ ok: false, error: "图片路径无效" });
+        const scope = localImageGrantScope(req.body);
+        if (!scope) return res.status(403).json({ ok: false, error: "图片路径未由当前生图任务授权" });
+        const key = localImageGrantKey(scope, filePath);
+        const grant = claimLocalImageGrant(localImageGrants, key);
+        if (!grant) return res.status(403).json({ ok: false, error: "图片路径未由当前生图任务授权" });
+        let resolvedFilePath: string;
+        let data: Buffer;
+        try {
+            resolvedFilePath = await realpath(grant.filePath);
+            if (!isLocalImagePath(resolvedFilePath)) {
+                completeLocalImageGrant(localImageGrants, key, grant);
+                return res.status(403).json({ ok: false, error: "图片路径无效" });
+            }
+            const file = await stat(resolvedFilePath);
+            if (!file.isFile()) {
+                completeLocalImageGrant(localImageGrants, key, grant);
+                return res.status(400).json({ ok: false, error: "图片文件无效" });
+            }
+            if (!file.size || file.size > LOCAL_IMAGE_MAX_BYTES) {
+                completeLocalImageGrant(localImageGrants, key, grant);
+                return res.status(413).json({ ok: false, error: "图片文件大小无效" });
+            }
+            data = await readFile(resolvedFilePath);
+            if (!data.byteLength || data.byteLength > LOCAL_IMAGE_MAX_BYTES) {
+                completeLocalImageGrant(localImageGrants, key, grant);
+                return res.status(413).json({ ok: false, error: "图片文件大小无效" });
+            }
+        } catch (error) {
+            releaseLocalImageGrant(localImageGrants, key, grant);
+            throw error;
+        }
+        completeLocalImageGrant(localImageGrants, key, grant);
         res.setHeader("Cache-Control", "no-store");
-        res.type(path.extname(filePath)).send(await readFile(filePath));
+        res.type(path.extname(resolvedFilePath)).send(data);
     }));
     app.post("/api/tools", route(async (req, res) => res.json({ ok: true, result: await session.callTool(req.body?.name, req.body?.input || {}) })));
     app.get("/agent/codex/workspace", (_req, res) => {
         const workspace = ensureSiteWorkspace(config);
         res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot });
     });
-    app.get("/agent/codex/models", route(async (_req, res) => res.json({ ok: true, ...(await listCodexModels(emit)) })));
+    app.get("/agent/codex/models", route(async (_req, res) => res.json({ ok: true, ...(await listCodexModels(codexEmit)) })));
     app.get("/agent/codex/skills", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
-        const result = await listCodexSkills(emit, workspace.workspacePath, String(req.query.forceReload || "") === "1");
+        const result = await listCodexSkills(codexEmit, workspace.workspacePath, String(req.query.forceReload || "") === "1");
         res.json({ ok: true, data: result.skills.map((skill) => ({ ...skill, managed: skillStore.isManagedPath(skill.path) })), errors: result.errors });
     }));
     app.post("/agent/codex/skills/draft", codexMutation(async (req, res) => {
@@ -195,17 +238,17 @@ export function startHttpServer() {
                 const threadId = String(req.body?.threadId || "");
                 if (!threadId) return res.status(409).json({ ok: false, error: "当前没有可提炼的对话" });
                 if (threadId !== (workspace.activeThreadId || "")) return res.status(409).json({ ok: false, error: "当前对话已在其他页面切换，请同步后重试" });
-                const history = await readCodexThread(emit, threadId, workspace.workspacePath);
+                const history = await readCodexThread(codexEmit, threadId, workspace.workspacePath);
                 if (!history.messages.some((message) => message.role === "user" && message.turnId)) return res.status(409).json({ ok: false, error: "当前对话还没有可提炼的已完成内容" });
                 session.setCodexState({ busy: true, threadId, turnId: "" }, { preserveReplay: true });
-                const data = await generateCodexSkillDraft(emit, workspace.workspacePath, { source, threadId, model, effort });
+                const data = await generateCodexSkillDraft(codexEmit, workspace.workspacePath, { source, threadId, model, effort });
                 if (!session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起提炼的网页已断开，请重新连接后再试" });
                 return res.json({ ok: true, data });
             }
             const snapshot = session.canvasStateForClient(clientId);
             if (!snapshot || (snapshot as Record<string, unknown>).hasCanvas === false) return res.status(409).json({ ok: false, error: "当前页面没有可提炼的画布" });
             session.setCodexState({ busy: true, threadId: workspace.activeThreadId || "", turnId: "" }, { preserveReplay: true });
-            const data = await generateCodexSkillDraft(emit, workspace.workspacePath, { source, snapshot, model, effort });
+            const data = await generateCodexSkillDraft(codexEmit, workspace.workspacePath, { source, snapshot, model, effort });
             if (!session.hasClient(clientId)) return res.status(409).json({ ok: false, error: "发起提炼的网页已断开，请重新连接后再试" });
             return res.json({ ok: true, data });
         } finally {
@@ -226,7 +269,7 @@ export function startHttpServer() {
         const workspace = ensureSiteWorkspace(config);
         const selector = skillSelector(req.body);
         if (selector.name !== routeParam(req.params.name)) return res.status(400).json({ ok: false, error: "Skill 选择无效" });
-        const data = await configureCodexSkill(emit, workspace.workspacePath, selector, req.body.enabled);
+        const data = await configureCodexSkill(codexEmit, workspace.workspacePath, selector, req.body.enabled);
         session.emitAll("skills_changed", { forceReload: true });
         res.json({ ok: true, data });
     }));
@@ -242,7 +285,7 @@ export function startHttpServer() {
     }));
     app.get("/agent/codex/threads", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
-        const result = await listCodexThreads(emit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || "") });
+        const result = await listCodexThreads(codexEmit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || "") });
         res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot, ...result });
     }));
     app.post("/agent/codex/threads/new", codexMutation(async (req, res) => {
@@ -262,7 +305,7 @@ export function startHttpServer() {
     app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const threadId = routeParam(req.params.threadId);
-        res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot, ...(await readCodexThread(emit, threadId, workspace.workspacePath)) });
+        res.json({ ok: true, workspace, conversation: session.conversationStateSnapshot, ...(await readCodexThread(codexEmit, threadId, workspace.workspacePath)) });
     }));
     app.post("/agent/codex/history/ack", (req, res) => {
         const threadId = String(req.body?.threadId || "");
@@ -285,7 +328,7 @@ export function startHttpServer() {
     app.post("/agent/codex/threads/:threadId/delete", codexMutation(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const threadId = routeParam(req.params.threadId);
-        await archiveCodexThread(emit, threadId, workspace.workspacePath);
+        await archiveCodexThread(codexEmit, threadId, workspace.workspacePath);
         const nextWorkspace = setActiveThread(workspace.activeThreadId === threadId ? "" : workspace.activeThreadId || "", { sourceClientId: String(req.body?.clientId || "") });
         res.json({ ok: true, workspace: nextWorkspace, conversation: session.conversationStateSnapshot });
     }));
@@ -309,7 +352,7 @@ export function startHttpServer() {
         }
         const model = String(req.body?.model || "") || undefined;
         const effort = reasoningEffort(req.body?.effort);
-        const skill = req.body?.skill === undefined ? undefined : await resolveCodexSkill(emit, workspace.workspacePath, skillSelector(req.body.skill), true);
+        const skill = req.body?.skill === undefined ? undefined : await resolveCodexSkill(codexEmit, workspace.workspacePath, skillSelector(req.body.skill), true);
         const messageId = String(req.body?.messageId || Date.now());
         const messageText = String(req.body?.messageText || prompt || `发送了 ${attachments.length} 张图片`);
         const messageMetadata = await messageMetadataStore.recordPending(messageId, req.body?.messageMetadata);
@@ -329,16 +372,18 @@ export function startHttpServer() {
             /** 将包装层日志和兜底错误固定广播到当前 turn。 */
             const lifecycleEmit = (type: string, payload: unknown) => {
                 const value = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { value: payload };
-                const eventThreadId = String(value.threadId || value.thread_id || threadId);
-                const eventTurnId = String(value.turnId || value.turn_id || turnId);
-                const sourceClientId = String(value.sourceClientId || clientId);
-                session.emitThread(type, eventThreadId, {
+                const payloadThreadId = String(value.threadId || value.thread_id || "");
+                const payloadTurnId = String(value.turnId || value.turn_id || "");
+                const eventThreadId = threadId || payloadThreadId;
+                const eventTurnId = turnId || payloadTurnId;
+                const data = {
                     ...value,
                     threadId: eventThreadId,
                     thread_id: eventThreadId,
                     ...(eventTurnId ? { turnId: eventTurnId, turn_id: eventTurnId } : {}),
-                    ...(sourceClientId ? { sourceClientId } : {}),
-                });
+                    sourceClientId: clientId,
+                };
+                session.emitThread(type, eventThreadId, data);
             };
             void runCodexTurn(withAttachmentContext(prompt, attachmentRefs), lifecycleEmit, attachments, {
                 threadId,
@@ -348,7 +393,7 @@ export function startHttpServer() {
                 effort,
                 ...(skill ? { skill: { name: skill.name, path: skill.path } } : {}),
                 messageText,
-                appEmit: emit,
+                appEmit: codexEmit,
                 onStart: () => session.bindClient(clientId),
                 onThread: (actualThreadId) => {
                     const threadChanged = actualThreadId !== threadId;
@@ -437,7 +482,7 @@ export function startHttpServer() {
         console.log(`Local URL: ${config.url}`);
         console.log(`Connect token: ${config.token}`);
         console.log("Codex MCP is not installed by this command.");
-        console.log("Optional MCP add: codex mcp add infinite-canvas -- npx -y @basketikun/canvas-agent mcp");
+        console.log("Optional MCP add: codex mcp add infinite-canvas -- npx -y @basketikun/canvas-agent@latest mcp");
         console.log("Remove manually added MCP: codex mcp remove infinite-canvas");
         if (logger.enabled) console.log(`Debug log: ${logger.filePath}`);
         logger.info("Canvas Agent started", { url: config.url, workspace: ensureSiteWorkspace(config).workspacePath, debugLog: logger.filePath });
@@ -519,19 +564,37 @@ function requestUrl(req: Request, config: CanvasAgentConfig) {
 
 /** 设置跨域响应头并记录通过 token 授权的来源。 */
 function setCors(req: Request, res: Response, url: URL, config: CanvasAgentConfig) {
-    const origin = req.headers.origin;
+    const rawOrigin = req.headers.origin;
+    const origin = normalizeOrigin(rawOrigin);
+    if (rawOrigin && !origin) return false;
     res.setHeader("Access-Control-Allow-Origin", origin || "*");
-    res.setHeader("Access-Control-Allow-Headers", "content-type,x-canvas-agent-token");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    const requestedHeaders = String(req.headers["access-control-request-headers"] || "").trim();
+    res.setHeader("Access-Control-Allow-Headers", requestedHeaders || "content-type,x-canvas-agent-token");
+    const requestedMethod = String(req.headers["access-control-request-method"] || "").trim().toUpperCase();
+    res.setHeader("Access-Control-Allow-Methods", requestedMethod || "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Private-Network", "true");
+    res.setHeader("Access-Control-Max-Age", "86400");
     if (!origin || req.method === "OPTIONS" || url.pathname === "/health" || url.pathname === "/config") return true;
-    config.origins ||= [];
-    if (validToken(req, url, config.token) && !config.origins.includes(origin)) {
+    const configuredOrigins = new Set((config.origins || []).map(normalizeOrigin).filter(Boolean));
+    config.origins = [...configuredOrigins];
+    if (validToken(req, url, config.token) && !configuredOrigins.has(origin)) {
         config.origins.push(origin);
         saveConfig(config);
     }
     res.setHeader("Vary", "Origin");
     return config.origins.includes(origin);
+}
+
+/** Normalize browser Origin values before comparing them with persisted entries. */
+function normalizeOrigin(value: unknown) {
+    if (typeof value !== "string" || value === "null") return "";
+    try {
+        const parsed = new URL(value);
+        if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password || parsed.pathname !== "/" || parsed.search || parsed.hash) return "";
+        return parsed.origin;
+    } catch {
+        return "";
+    }
 }
 
 /** 校验请求查询参数或请求头中的连接 token。 */

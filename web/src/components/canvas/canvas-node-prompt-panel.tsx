@@ -9,6 +9,8 @@ import { useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-
 import { canvasThemes } from "@/lib/canvas-theme";
 import { buildGenerationConfig } from "@/lib/canvas/canvas-generation-helpers";
 import { buildCanvasPromptOptimizationContext, createCanvasPromptOptimizationBinding, type CanvasPromptOptimizationBinding } from "@/lib/canvas/canvas-prompt-optimization";
+import type { PromptOptimizationContext, PromptOptimizationScenario } from "@/services/api/prompt-optimization";
+import type { ReferenceImage } from "@/types/image";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
 import { CanvasPromptLibrary } from "./canvas-prompt-library";
@@ -16,10 +18,9 @@ import { CanvasAudioSettingsPopover, type CanvasAudioSettingKey } from "./canvas
 import { CanvasPromptChipInput } from "./canvas-prompt-chip-input";
 import { CanvasVideoSettingsPopover } from "./canvas-video-settings-popover";
 import { CanvasTextSettingsPopover } from "./canvas-text-settings-popover";
-import { CanvasNodeType, type CanvasGenerationMode, type CanvasNodeData, type CanvasNodeMetadata } from "@/types/canvas";
-import type { PromptOptimizationContext, PromptOptimizationScenario } from "@/services/api/prompt-optimization";
-import type { ReferenceImage } from "@/types/image";
+import { CanvasNodeType, type CanvasGenerationMode, type CanvasNodeData } from "@/types/canvas";
 import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { CanvasNodeReferenceBar } from "./canvas-node-reference-bar";
 
 export type CanvasNodeGenerationMode = CanvasGenerationMode;
 
@@ -27,12 +28,16 @@ type CanvasNodePromptPanelProps = {
     node: CanvasNodeData;
     isRunning: boolean;
     onPromptChange: (nodeId: string, prompt: string) => void;
-    onConfigChange: (nodeId: string, patch: Partial<CanvasNodeMetadata>) => void;
+    onConfigChange: (nodeId: string, patch: Partial<CanvasNodeData["metadata"]>) => void;
     onGenerate: (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => void;
     onStop: (nodeId: string) => void;
     mentionReferences?: CanvasResourceReference[];
     getOptimizationReferences?: (nodeId: string, mode: PromptOptimizationScenario) => ReferenceImage[];
     onOptimizationApplied?: (nodeId: string, binding: CanvasPromptOptimizationBinding) => void;
+    nodes: CanvasNodeData[];
+    connectedNodes?: CanvasNodeData[];
+    onDisconnectReference?: (fromNodeId: string, toNodeId: string) => void;
+    onStartReferenceSelection?: (nodeId: string) => void;
     onImageSettingsOpenChange?: (open: boolean) => void;
     modeOverride?: CanvasNodeGenerationMode; // Plugin nodes set their generation type through useBuiltinPanel.mode.
 };
@@ -43,7 +48,7 @@ type PromptOptimizationSession = {
     context: PromptOptimizationContext;
 };
 
-export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfigChange, onGenerate, onStop, mentionReferences = [], getOptimizationReferences, onOptimizationApplied, onImageSettingsOpenChange, modeOverride }: CanvasNodePromptPanelProps) {
+export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, onConfigChange, onGenerate, onStop, mentionReferences = [], getOptimizationReferences, onOptimizationApplied, connectedNodes = [], onDisconnectReference, onStartReferenceSelection, onImageSettingsOpenChange, modeOverride }: CanvasNodePromptPanelProps) {
     const { message } = App.useApp();
     const { t } = useTranslation();
     const globalConfig = useEffectiveConfig();
@@ -65,6 +70,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
         setPrompt(node.metadata?.composerContent ?? node.metadata?.prompt ?? "");
         pendingPromptOptimizationRef.current = null;
         setPromptOptimizationSession(null);
+        setExpanded(false);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [node.id]);
 
@@ -91,9 +97,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
         if (expanded) {
             pendingPromptOptimizationRef.current = session;
             setExpanded(false);
-            return;
-        }
-        setPromptOptimizationSession(session);
+        } else setPromptOptimizationSession(session);
     };
 
     return (
@@ -105,6 +109,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
             onPointerDown={(event) => event.stopPropagation()}
             onWheel={(event) => event.stopPropagation()}
         >
+            <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={onStartReferenceSelection} />
             <CanvasPromptChipInput
                 value={prompt}
                 references={mentionReferences}
@@ -124,15 +129,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
                     {optimizationMode ? (
                         <Tooltip title={t(`${optimizationMode}Workbench.promptOptimization.action`)}>
                             <span className="inline-flex shrink-0">
-                                <Button
-                                    type="text"
-                                    className="!h-8 !w-8 !min-w-8 !rounded-full !bg-transparent !p-0 hover:!bg-black/5 dark:hover:!bg-white/10"
-                                    style={{ color: theme.node.text }}
-                                    icon={<WandSparkles className="size-3.5" />}
-                                    disabled={isRunning}
-                                    onClick={openPromptOptimization}
-                                    aria-label={t(`${optimizationMode}Workbench.promptOptimization.action`)}
-                                />
+                                <Button type="text" className="!h-8 !w-8 !min-w-8 !rounded-full !bg-transparent !p-0 hover:!bg-black/5 dark:hover:!bg-white/10" style={{ color: theme.node.text }} icon={<WandSparkles className="size-3.5" />} disabled={isRunning} onClick={openPromptOptimization} aria-label={t(`${optimizationMode}Workbench.promptOptimization.action`)} />
                             </span>
                         </Tooltip>
                     ) : null}
@@ -151,7 +148,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
                     ) : mode === "video" ? (
                         <>
                             <ModelPicker config={config} value={config.model} onChange={(model) => onConfigChange(node.id, { model })} capability="video" onMissingConfig={() => openConfigDialog(true)} className="max-w-[190px]" />
-                            <CanvasVideoSettingsPopover config={config} buttonClassName="!h-10 !max-w-[170px] !justify-start !rounded-full !px-3" onConfigChange={(key, value) => onConfigChange(node.id, videoConfigPatch(key, value))} />
+                            <CanvasVideoSettingsPopover config={config} buttonClassName="!h-10 !max-w-[220px] !justify-start !rounded-full !px-3" onConfigChange={(key, value) => onConfigChange(node.id, videoConfigPatch(key, value))} />
                         </>
                     ) : mode === "audio" ? (
                         <>
@@ -187,30 +184,17 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
                 </Button>
             </div>
             <Modal
-                title={
-                    <div className="flex items-center justify-between gap-3 pr-7">
-                        <span>{t("canvas.promptPanel.editorTitle")}</span>
-                        {optimizationMode ? (
-                            <Button type="text" size="small" icon={<WandSparkles className="size-3.5" />} disabled={isRunning} onClick={openPromptOptimization}>
-                                {t(`${optimizationMode}Workbench.promptOptimization.action`)}
-                            </Button>
-                        ) : null}
-                    </div>
-                }
-                open={expanded}
-                centered
-                width={760}
-                footer={null}
-                onCancel={() => setExpanded(false)}
+                title={<div className="flex items-center justify-between gap-3 pr-7"><span>{t("canvas.promptPanel.editorTitle")}</span>{optimizationMode ? <Button type="text" size="small" icon={<WandSparkles className="size-3.5" />} disabled={isRunning} onClick={openPromptOptimization}>{t(`${optimizationMode}Workbench.promptOptimization.action`)}</Button> : null}</div>}
+                open={expanded} centered width={760} footer={null} onCancel={() => setExpanded(false)} destroyOnHidden
                 afterOpenChange={(open) => {
                     if (open || !pendingPromptOptimizationRef.current) return;
                     const session = pendingPromptOptimizationRef.current;
                     pendingPromptOptimizationRef.current = null;
                     setPromptOptimizationSession(session);
                 }}
-                destroyOnHidden
             >
                 <div data-canvas-no-zoom className="pt-2" onWheelCapture={(event) => event.stopPropagation()}>
+                    <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={(nodeId) => { setExpanded(false); onStartReferenceSelection?.(nodeId); }} />
                     <CanvasPromptChipInput
                         value={prompt}
                         references={mentionReferences}
@@ -232,10 +216,7 @@ export function CanvasNodePromptPanel({ node, isRunning, onPromptChange, onConfi
                     onApply={(value) => {
                         const optimizedPrompt = value.trim();
                         updatePrompt(optimizedPrompt);
-                        onOptimizationApplied?.(
-                            node.id,
-                            createCanvasPromptOptimizationBinding(optimizedPrompt, optimizationMode, promptOptimizationSession.context, promptOptimizationSession.references),
-                        );
+                        onOptimizationApplied?.(node.id, createCanvasPromptOptimizationBinding(optimizedPrompt, optimizationMode, promptOptimizationSession.context, promptOptimizationSession.references));
                         setPromptOptimizationSession(null);
                         message.success(t(`${optimizationMode}Workbench.promptOptimization.applied`));
                     }}
@@ -254,6 +235,7 @@ function videoConfigPatch(key: keyof AiConfig, value: string) {
     if (key === "videoSeconds") return { seconds: value };
     if (key === "videoGenerateAudio") return { generateAudio: value };
     if (key === "videoWatermark") return { watermark: value };
+    if (key === "videoMode") return { videoMode: value };
     return { [key]: value };
 }
 

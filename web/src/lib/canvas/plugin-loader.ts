@@ -3,6 +3,8 @@ import { getPluginRuntime } from "@/lib/canvas/plugin-runtime";
 import { usePluginStore, type InstalledPlugin } from "@/stores/canvas/use-plugin-store";
 import type { CanvasPlugin } from "@/types/canvas-plugin";
 import i18n from "@/i18n";
+import { isAbortError, isBrowserNetworkError, isOriginNotAllowedFetchResponse, networkFailureMessage } from "@/lib/network-errors";
+import { withLocalProxy } from "@/stores/use-config-store";
 
 const cleanups = new Map<string, () => void>();
 
@@ -46,8 +48,25 @@ export function deactivatePlugin(pluginId: string) {
 }
 
 async function fetchPluginSource(url: string) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(i18n.t("canvas.pluginErrors.downloadFailed", { status: response.status }));
+    const requestUrl = withLocalProxy(url);
+    let response: Response;
+    try {
+        response = await fetch(requestUrl);
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (isBrowserNetworkError(error)) {
+            throw new Error(networkFailureMessage(error, requestUrl, {
+                cors: i18n.t("apiErrors.corsRequired"),
+                proxy: i18n.t("config.proxy.unreachable"),
+                fallback: i18n.t("apiErrors.requestFailed"),
+            }));
+        }
+        throw error;
+    }
+    if (!response.ok) {
+        if (await isOriginNotAllowedFetchResponse(response, requestUrl)) throw new Error(i18n.t("config.proxy.originNotAllowed"));
+        throw new Error(i18n.t("canvas.pluginErrors.downloadFailed", { status: response.status }));
+    }
     return response.text();
 }
 

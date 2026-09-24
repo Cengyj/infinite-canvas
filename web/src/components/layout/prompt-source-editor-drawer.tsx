@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { PromptSource } from "@/services/api/prompt-source-presets";
+import { isHttpUrl } from "@/stores/use-config-store";
 
 export function PromptSourceEditorDrawer({ open, source, onSave, onClose }: { open: boolean; source: PromptSource | null; onSave: (source: PromptSource) => void; onClose: () => void }) {
     const { message } = App.useApp();
@@ -79,10 +80,4 @@ export function PromptSourceEditorDrawer({ open, source, onSave, onClose }: { op
     );
 }
 
-function isHttpUrl(value: string) {
-    try {
-        return ["http:", "https:"].includes(new URL(value).protocol);
-    } catch {
-        return false;
-    }
-}
+ 

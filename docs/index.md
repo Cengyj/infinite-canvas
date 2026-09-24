@@ -6,7 +6,7 @@
 - [Features](/docs/overview/features)
 - [Deploy on Render](/docs/overview/render)
 - [Docker Deployment](/docs/overview/docker)
-- [Third-party GitHub Prompt Repositories](/docs/overview/third-party-prompt-repositories)
+- [Third-party Prompt Sources](/docs/overview/third-party-prompt-repositories)
 
 ## Canvas Guide
 
@@ -31,6 +31,8 @@
 
 ## Project Progress
 
+- [Current Change Review (local source audit)](current-change-review.md)
+- [Custom Merge Review](custom-merge-review.md)
 - [Changelog](/docs/progress/changelog)
 - [Pending Tests](/docs/progress/pending-test)
 - [TODO](/docs/progress/todo)

@@ -283,20 +283,37 @@ test("补充事件写入本地 JSON 后可在 Agent 重启后恢复", async (con
     assert.deepEqual(await new CodexEventHistory(file).readThread("thread-1"), { items: [entry], turns: [] });
 });
 
-test("补充历史 JSON 损坏后会从空历史恢复并允许重新写入", async (context) => {
+test("补充历史 JSON 损坏后拒绝读取和覆盖原文件，并保留隔离副本", async (context) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "canvas-agent-history-"));
     context.after(() => fs.rm(directory, { recursive: true, force: true }));
     const file = path.join(directory, "codex-event-history.json");
-    await fs.writeFile(file, "{\"version\":1,\"items\":[");
+    const original = "{\"version\":1,\"items\":[";
+    await fs.writeFile(file, original);
     const history = new CodexEventHistory(file);
 
-    assert.deepEqual(await history.readThread("thread-1"), { items: [], turns: [] });
-    await history.record({ threadId: "thread-1", turnId: "turn-1", itemId: "item-1", item: { id: "item-1", type: "agent_message", text: "恢复成功" } });
+    await assert.rejects(() => history.readThread("thread-1"), /Codex event history is invalid/);
+    await assert.rejects(() => history.record({ threadId: "thread-1", turnId: "turn-1", itemId: "item-1", item: { id: "item-1", type: "agent_message", text: "恢复成功" } }), /Codex event history is invalid/);
+    assert.equal(await fs.readFile(file, "utf8"), original);
+    const quarantineFiles = (await fs.readdir(directory)).filter((name) => name.startsWith("codex-event-history.json.quarantine-"));
+    assert.equal(quarantineFiles.length, 1);
+    assert.equal(await fs.readFile(path.join(directory, quarantineFiles[0]), "utf8"), original);
+});
 
-    assert.deepEqual(await new CodexEventHistory(file).readThread("thread-1"), {
-        items: [{ threadId: "thread-1", turnId: "turn-1", itemId: "item-1", item: { id: "item-1", type: "agent_message", text: "恢复成功" } }],
-        turns: [],
-    });
+test("补充历史未知版本或非法结构拒绝覆盖原文件", async (context) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "canvas-agent-history-"));
+    context.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const cases = [
+        ["unknown-version", { version: 99, items: [], turns: [] }],
+        ["invalid-entry", { version: 1, items: [{ threadId: "thread-1" }], turns: [] }],
+    ] as const;
+    for (const [name, value] of cases) {
+        const file = path.join(directory, `${name}.json`);
+        const original = JSON.stringify(value);
+        await fs.writeFile(file, original);
+        const history = new CodexEventHistory(file);
+        await assert.rejects(() => history.record({ threadId: "thread-1", turnId: "turn-1", itemId: "item-1", item: { id: "item-1" } }), /Refusing to overwrite existing data/);
+        assert.equal(await fs.readFile(file, "utf8"), original);
+    }
 });
 
 test("标准历史尚未物化 turn 时从本地终态事件恢复完整对话", async (context) => {
@@ -333,7 +350,7 @@ test("归档线程只清除该线程的补充事件", async (context) => {
     assert.deepEqual(await history.readThread("thread-2"), { items: [entry("thread-2")], turns: [] });
 });
 
-test("补充事件更新时保留已有字段并限制单项输出大小", async (context) => {
+test("补充事件更新时保留已有字段和完整输出", async (context) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "canvas-agent-history-"));
     context.after(() => fs.rm(directory, { recursive: true, force: true }));
     const history = new CodexEventHistory(path.join(directory, "codex-event-history.json"));
@@ -344,7 +361,31 @@ test("补充事件更新时保留已有字段并限制单项输出大小", async
     assert.equal(entry.sequence, 1);
     assert.equal(entry.item.command, "Get-Location");
     assert.equal(entry.item.cwd, "D:\\infinite-canvas");
-    assert.equal(String(entry.item.aggregatedOutput).endsWith("[输出已截断]"), true);
+    assert.equal(String(entry.item.aggregatedOutput).length, 100_001);
+});
+
+test("补充历史不会静默裁剪条目，且独立实例并发写入不会互相覆盖", async (context) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "canvas-agent-history-"));
+    context.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const file = path.join(directory, "codex-event-history.json");
+    const items = Array.from({ length: 5_001 }, (_, index) => ({
+        threadId: "thread-1",
+        turnId: `turn-${index}`,
+        itemId: `item-${index}`,
+        item: { id: `item-${index}`, type: "agent_message", text: `消息 ${index}` },
+    }));
+    await fs.writeFile(file, JSON.stringify({ version: 1, items, turns: [] }));
+    const first = new CodexEventHistory(file);
+    const second = new CodexEventHistory(file);
+    await Promise.all([
+        first.record({ threadId: "thread-1", turnId: "turn-a", itemId: "item-a", item: { id: "item-a", type: "agent_message", text: "并发 A" } }),
+        second.record({ threadId: "thread-1", turnId: "turn-b", itemId: "item-b", item: { id: "item-b", type: "agent_message", text: "并发 B" } }),
+    ]);
+
+    const history = await new CodexEventHistory(file).readThread("thread-1");
+    assert.equal(history.items.length, 5_003);
+    assert.equal(history.items.some((item) => item.itemId === "item-a"), true);
+    assert.equal(history.items.some((item) => item.itemId === "item-b"), true);
 });
 
 test("补充事件落盘失败时不污染内存读取", async (context) => {
@@ -355,7 +396,7 @@ test("补充事件落盘失败时不污染内存读取", async (context) => {
     assert.deepEqual(await history.readThread("thread-1"), { items: [], turns: [] });
     await fs.mkdir(file);
     await assert.rejects(() => history.record({ threadId: "thread-1", turnId: "turn-1", itemId: "command-1", item: { id: "command-1", type: "command_execution" } }));
-    assert.deepEqual(await history.readThread("thread-1"), { items: [], turns: [] });
+    await assert.rejects(() => history.readThread("thread-1"), /EISDIR|directory/i);
 });
 
 test("turn 错误优先于条目错误且只生成一张错误卡片", () => {

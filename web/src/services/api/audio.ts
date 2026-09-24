@@ -2,8 +2,9 @@ import axios from "axios";
 
 import i18n from "@/i18n";
 import { audioMimeType, normalizeAudioFormatValue, normalizeAudioSpeedValue, normalizeAudioVoiceValue } from "@/lib/audio-generation";
+import { isAbortError, isBrowserNetworkError, isOriginNotAllowedFetchResponse, isOriginNotAllowedResponse, networkFailureMessage } from "@/lib/network-errors";
 import { uploadMediaFile, type UploadedFile } from "@/services/file-storage";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig } from "@/stores/use-config-store";
+import { buildApiUrl, isHttpUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
 
 type RequestOptions = { signal?: AbortSignal };
@@ -46,9 +47,10 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
     assertAudioConfig(requestConfig, model);
     const instructions = config.audioInstructions.trim();
 
+    const requestUrl = aiApiUrl(requestConfig, "/audio/speech");
     try {
         const response = await axios.post<Blob>(
-            aiApiUrl(requestConfig, "/audio/speech"),
+            requestUrl,
             {
                 model,
                 input: prompt,
@@ -62,7 +64,7 @@ export async function requestAudioGeneration(config: AiConfig, prompt: string, o
         await assertAudioBlob(response.data);
         return response.data.type.startsWith("audio/") ? response.data : new Blob([response.data], { type: audioMimeType(format) });
     } catch (error) {
-        throw new Error(readAxiosError(error, apiText("audioGenerationFailed")));
+        throw new Error(readAxiosError(error, apiText("audioGenerationFailed"), requestUrl));
     }
 }
 
@@ -75,8 +77,21 @@ async function audioPluginBlob(result: unknown, format: string): Promise<Blob> {
         source = typeof record.b64_json === "string" ? record.b64_json : typeof record.data === "string" ? record.data : typeof record.url === "string" ? record.url : "";
     }
     if (!source) throw new Error(apiText("scriptNoAudio"));
-    const url = source.startsWith("data:") || /^https?:/i.test(source) ? source : `data:${audioMimeType(format)};base64,${source}`;
-    const blob = await (await fetch(url)).blob();
+    const url = source.startsWith("data:") || isHttpUrl(source) ? source : `data:${audioMimeType(format)};base64,${source}`;
+    const requestUrl = withLocalProxy(url);
+    let response: Response;
+    try {
+        response = await fetch(requestUrl);
+    } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (isBrowserNetworkError(error)) throw new Error(networkFailureMessage(error, requestUrl, { cors: apiText("corsRequired"), proxy: i18n.t("config.proxy.unreachable"), fallback: apiText("audioGenerationFailed") }));
+        throw error;
+    }
+    if (!response.ok) {
+        if (await isOriginNotAllowedFetchResponse(response, requestUrl)) throw new Error(i18n.t("config.proxy.originNotAllowed"));
+        throw new Error(apiText("audioGenerationFailed"));
+    }
+    const blob = await response.blob();
     return blob.type.startsWith("audio/") ? blob : new Blob([blob], { type: audioMimeType(format) });
 }
 
@@ -132,18 +147,20 @@ function readApiErrorMessage(value: unknown): string {
     );
 }
 
-function readAxiosError(error: unknown, fallback: string) {
+function readAxiosError(error: unknown, fallback: string, requestUrl = "") {
     if (axios.isCancel(error)) return apiText("requestCanceled");
     if (axios.isAxiosError(error)) {
-        if (!error.response && error.code === "ERR_NETWORK") return apiText("corsRequired");
+        if (!error.response && error.code === "ERR_NETWORK") return networkFailureMessage(error, requestUrl || String(error.config?.url || ""), { cors: apiText("corsRequired"), proxy: i18n.t("config.proxy.unreachable"), fallback: apiText("requestFailed") });
         const responseData = error.response?.data;
+        if (isOriginNotAllowedResponse(error.response, requestUrl || String(error.config?.url || ""))) return i18n.t("config.proxy.originNotAllowed");
         const apiMsg = readApiErrorMessage(responseData);
         if (apiMsg) return apiMsg;
         const statusMsg = statusMessage(error.response?.status, fallback);
         if (statusMsg) return statusMsg;
         return error.message || fallback;
     }
-    if (error instanceof DOMException && error.name === "AbortError") return apiText("requestCanceled");
+    if (isAbortError(error)) return apiText("requestCanceled");
+    if (isBrowserNetworkError(error) && requestUrl) return networkFailureMessage(error, requestUrl, { cors: apiText("corsRequired"), proxy: i18n.t("config.proxy.unreachable"), fallback: apiText("requestFailed") });
     return error instanceof Error ? readApiErrorMessage(error.message) || error.message : fallback;
 }
 

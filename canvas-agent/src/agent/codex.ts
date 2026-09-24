@@ -176,8 +176,8 @@ async function mergeMessageMetadata<T extends { role: string; threadId: string; 
     try {
         return await messageMetadataStore.mergeThread(threadId, messages);
     } catch (error) {
-        logger.warn("Failed to read thread message metadata", { threadId, error });
-        return messages;
+        logger.error("Failed to read thread message metadata", { threadId, error });
+        throw new Error(`消息元数据读取失败，已拒绝显示不完整历史：${errorMessage(error)}`, { cause: error instanceof Error ? error : undefined });
     }
 }
 

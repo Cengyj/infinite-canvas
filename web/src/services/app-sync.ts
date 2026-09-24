@@ -1,21 +1,24 @@
 import localforage from "localforage";
+import { retainMediaReferences } from "@/services/media-references";
 
 import i18n from "@/i18n";
-import { getMediaBlob, resolveMediaUrl, setMediaBlob } from "@/services/file-storage";
-import { createImageStorageLease, getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
+import { generationLogRank, mergeSyncCollection, newerSyncItem, type SyncDeletedItem } from "@/lib/sync-merge";
+import { cleanupUnusedMedia, getMediaBlob, resolveMediaUrl, setMediaBlob } from "@/services/file-storage";
+import { isGenerationLogDeleted, mergeGenerationLogDeletions, readGenerationLogDeletions, withGenerationLogLock, type GenerationLogKind } from "@/services/generation-log-deletions";
+import { cleanupUnusedImages, getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
 import { downloadWebdavFile, uploadWebdavFile, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import type { Asset } from "@/stores/use-asset-store";
 import { useAssetStore } from "@/stores/use-asset-store";
 import type { WebdavSyncConfig } from "@/stores/use-config-store";
-import type { CanvasProject } from "@/stores/canvas/use-canvas-store";
+import type { CanvasDeletedProject, CanvasProject } from "@/stores/canvas/use-canvas-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 
 type StoredLog = Record<string, unknown> & { id?: string };
 export type AppSyncDomainKey = "canvas" | "assets" | "image-workbench" | "video-workbench";
 type DomainKey = AppSyncDomainKey;
-type CanvasDomainData = { projects: CanvasProject[] };
-type AssetDomainData = { assets: Asset[] };
-type LogDomainData = { logs: StoredLog[] };
+type CanvasDomainData = { projects: CanvasProject[]; deleted: CanvasDeletedProject[] };
+type AssetDomainData = { assets: Asset[]; deleted: SyncDeletedItem[] };
+type LogDomainData = { logs: StoredLog[]; deleted: SyncDeletedItem[] };
 
 type AppSyncFile = {
     storageKey: string;
@@ -39,7 +42,7 @@ type SyncDomainOptions<T> = {
     localData: () => Promise<T>;
     emptyData: T;
     mergeData: (local: T, remote: T) => T;
-    applyData?: (data: T) => Promise<void>;
+    applyData?: (data: T) => Promise<T | void>;
 };
 
 type SyncDomainResult<T> = {
@@ -84,41 +87,62 @@ const storageKeyPattern = /^(image|video|audio|file|video-reference|audio-refere
 export async function syncAppDataToWebdav(config: WebdavSyncConfig, onProgress?: AppSyncProgress): Promise<AppSyncResult> {
     emitProgress(onProgress, { stage: "等待本地数据加载" });
     await Promise.all([waitForHydration(useCanvasStore), waitForHydration(useAssetStore)]);
+    if (!useCanvasStore.getState().storageReady || !useAssetStore.getState().storageReady) throw new Error(i18n.t("config.webdav.localReadFailed"));
 
     const [canvas, assets, imageLogs, videoLogs] = await Promise.all([
         syncDomain<CanvasDomainData>(config, onProgress, {
             key: "canvas",
             label: "画布",
-            emptyData: { projects: [] },
-            localData: async () => ({ projects: useCanvasStore.getState().projects }),
-            mergeData: (local, remote) => ({ projects: mergeById(local.projects, remote.projects, "updatedAt") }),
-            applyData: async (data) => useCanvasStore.getState().replaceProjects(data.projects),
+            emptyData: { projects: [], deleted: [] },
+            localData: async () => {
+                const { projects, deletedProjects } = useCanvasStore.getState();
+                return { projects, deleted: deletedProjects };
+            },
+            mergeData: mergeCanvasData,
+            applyData: async (data) => {
+                const state = useCanvasStore.getState();
+                const latest = mergeCanvasData({ projects: state.projects, deleted: state.deletedProjects }, data);
+                state.replaceProjects(latest.projects, latest.deleted);
+                return latest;
+            },
         }),
         syncDomain<AssetDomainData>(config, onProgress, {
             key: "assets",
             label: "我的资产",
-            emptyData: { assets: [] },
-            localData: async () => ({ assets: useAssetStore.getState().assets }),
-            mergeData: (local, remote) => ({ assets: mergeById(local.assets, remote.assets, "updatedAt") }),
-            applyData: async (data) => useAssetStore.getState().replaceAssets(await Promise.all(data.assets.map(hydrateAsset))),
+            emptyData: { assets: [], deleted: [] },
+            localData: async () => {
+                const { assets, deletedAssets } = useAssetStore.getState();
+                return { assets, deleted: deletedAssets || [] };
+            },
+            mergeData: mergeAssetData,
+            applyData: async (data) => {
+                const hydrated = await Promise.all(data.assets.map(hydrateAsset));
+                const state = useAssetStore.getState();
+                const latest = mergeSyncCollection(state.assets, hydrated, state.deletedAssets || [], data.deleted, "updatedAt");
+                state.replaceAssets(latest.items, latest.deleted);
+                return { assets: latest.items, deleted: latest.deleted };
+            },
         }),
         syncDomain<LogDomainData>(config, onProgress, {
             key: "image-workbench",
             label: "生图工作台",
-            emptyData: { logs: [] },
-            localData: async () => ({ logs: await readStoredLogs(imageLogStore) }),
-            mergeData: (local, remote) => ({ logs: mergeById(local.logs, remote.logs, "createdAt") }),
-            applyData: async (data) => replaceStoredLogs(imageLogStore, data.logs),
+            emptyData: { logs: [], deleted: [] },
+            localData: () => readLogDomain("image", imageLogStore),
+            mergeData: mergeLogData,
+            applyData: (data) => applyLogDomain("image", imageLogStore, data),
         }),
         syncDomain<LogDomainData>(config, onProgress, {
             key: "video-workbench",
             label: "视频创作台",
-            emptyData: { logs: [] },
-            localData: async () => ({ logs: await readStoredLogs(videoLogStore) }),
-            mergeData: (local, remote) => ({ logs: mergeById(local.logs, remote.logs, "createdAt") }),
-            applyData: async (data) => replaceStoredLogs(videoLogStore, data.logs),
+            emptyData: { logs: [], deleted: [] },
+            localData: () => readLogDomain("video", videoLogStore),
+            mergeData: mergeLogData,
+            applyData: (data) => applyLogDomain("video", videoLogStore, data),
         }),
     ]);
+
+    const usedData = { projects: useCanvasStore.getState().projects, assets: useAssetStore.getState().assets };
+    await Promise.all([cleanupUnusedImages(usedData), cleanupUnusedMedia(usedData)]);
 
     const result = {
         syncedAt: new Date().toISOString(),
@@ -137,35 +161,35 @@ export async function syncAppDataToWebdav(config: WebdavSyncConfig, onProgress?:
 }
 
 async function syncDomain<T>(config: WebdavSyncConfig, onProgress: AppSyncProgress | undefined, options: SyncDomainOptions<T>): Promise<SyncDomainResult<T>> {
+    let retainedData: T | undefined;
+    const release = retainMediaReferences(() => retainedData);
     try {
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: "读取远端清单", status: "active" });
         const remoteManifest = await readDomainManifest(config, options.key, options.emptyData);
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: "读取本地数据", status: "active" });
         const localData = await options.localData();
         const mergedData = remoteManifest ? options.mergeData(localData, remoteManifest.data) : localData;
+        retainedData = mergedData;
+        let currentData = mergedData;
 
         if (remoteManifest) {
-            const lease = createImageStorageLease(collectStorageKeys(mergedData).filter((key) => key.startsWith("image:")));
-            try {
-                emitProgress(onProgress, { domain: options.key, label: options.label, stage: "下载缺失媒体", status: "active" });
-                await downloadMissingFiles(config, options.key, mergedData, remoteManifest.files, onProgress);
-                emitProgress(onProgress, { domain: options.key, label: options.label, stage: "写入本地合并结果", status: "active" });
-                await options.applyData?.(mergedData);
-            } finally {
-                lease.release();
-            }
+            emitProgress(onProgress, { domain: options.key, label: options.label, stage: "下载缺失媒体", status: "active" });
+            await downloadMissingFiles(config, options.key, mergedData, remoteManifest.files, onProgress);
+            emitProgress(onProgress, { domain: options.key, label: options.label, stage: "写入本地合并结果", status: "active" });
+            currentData = (await options.applyData?.(mergedData)) || mergedData;
+            retainedData = currentData;
         }
 
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: "上传新增媒体", status: "active" });
-        const uploaded = await uploadChangedFiles(config, options.key, mergedData, remoteManifest?.files || [], onProgress);
-        const manifest: DomainManifest<T> = { app: "infinite-canvas", version: 1, domain: options.key, exportedAt: new Date().toISOString(), data: mergedData, files: uploaded.files };
+        const uploaded = await uploadChangedFiles(config, options.key, currentData, remoteManifest?.files || [], onProgress);
+        const manifest: DomainManifest<T> = { app: "infinite-canvas", version: 1, domain: options.key, exportedAt: new Date().toISOString(), data: currentData, files: uploaded.files };
         const manifestFile = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json" });
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: `上传清单 ${formatBytes(manifestFile.size)}`, status: "active" });
         await uploadWebdavFile(config, domainPath(options.key, WEBDAV_MANIFEST_FILE_NAME), manifestFile, "application/json");
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: "完成", current: 1, total: 1, status: "success" });
 
         return {
-            data: mergedData,
+            data: currentData,
             mergedRemote: Boolean(remoteManifest),
             files: uploaded.files.length,
             manifestBytes: manifestFile.size,
@@ -175,6 +199,8 @@ async function syncDomain<T>(config: WebdavSyncConfig, onProgress: AppSyncProgre
     } catch (error) {
         emitProgress(onProgress, { domain: options.key, label: options.label, stage: error instanceof Error ? error.message : i18n.t("config.webdav.errors.syncFailed"), status: "exception" });
         throw error;
+    } finally {
+        release();
     }
 }
 
@@ -182,7 +208,13 @@ async function readDomainManifest<T>(config: WebdavSyncConfig, domain: DomainKey
     const file = await downloadWebdavFile(config, domainPath(domain, WEBDAV_MANIFEST_FILE_NAME));
     if (!file) return null;
     const data = JSON.parse(await file.text()) as DomainManifest<T>;
-    if (data.app !== "infinite-canvas" || data.domain !== domain) throw new Error(i18n.t("config.webdav.errors.invalidManifest", { domain }));
+    const items = domain === "canvas" ? "projects" : domain === "assets" ? "assets" : "logs";
+    if (
+        !data || data.app !== "infinite-canvas" || data.version !== 1 || data.domain !== domain ||
+        !data.data || typeof data.data !== "object" || !Array.isArray((data.data as Record<string, unknown>)[items]) ||
+        ((data.data as Record<string, unknown>).deleted !== undefined && !Array.isArray((data.data as Record<string, unknown>).deleted)) ||
+        !Array.isArray(data.files)
+    ) throw new Error(i18n.t("config.webdav.errors.invalidManifest", { domain }));
     return {
         app: "infinite-canvas",
         version: 1,
@@ -289,12 +321,67 @@ async function readStoredLogs(store: LogStore) {
     return logs;
 }
 
-async function replaceStoredLogs(store: LogStore, logs: StoredLog[]) {
-    await store.clear();
-    await runWithConcurrency(logs, FILE_CONCURRENCY, async (log) => {
-        const id = getStringField(log, "id");
-        if (id) await store.setItem(id, log);
+async function readLogDomain(kind: GenerationLogKind, store: LogStore): Promise<LogDomainData> {
+    const [logs, deleted] = await Promise.all([readStoredLogs(store), readGenerationLogDeletions(kind)]);
+    return { logs, deleted };
+}
+
+async function applyLogDomain(kind: GenerationLogKind, store: LogStore, data: LogDomainData) {
+    await runWithConcurrency(data.deleted, FILE_CONCURRENCY, async (item) => {
+        if (!item.id || !item.deletedAt) return;
+        await withGenerationLogLock(kind, item.id, () => mergeGenerationLogDeletions(kind, [item]));
     });
+    const deleted = await readGenerationLogDeletions(kind);
+    const deletedIds = new Set(deleted.map((item) => item.id));
+    await runWithConcurrency([...deletedIds], FILE_CONCURRENCY, (id) => withGenerationLogLock(kind, id, () => store.removeItem(id)));
+    await runWithConcurrency(data.logs, FILE_CONCURRENCY, async (log) => {
+        const id = getStringField(log, "id");
+        if (!id || deletedIds.has(id)) return;
+        await withGenerationLogLock(kind, id, async () => {
+            if (await isGenerationLogDeleted(kind, id)) return;
+            const current = await store.getItem<StoredLog>(id);
+            await store.setItem(id, newerSyncItem(current, log, "createdAt", generationLogRank));
+        });
+    });
+    const latestDeleted = await readGenerationLogDeletions(kind);
+    await Promise.all(latestDeleted.map((item) => withGenerationLogLock(kind, item.id, () => store.removeItem(item.id))));
+    return readLogDomain(kind, store);
+}
+
+function mergeAssetData(local: AssetDomainData, remote: AssetDomainData): AssetDomainData {
+    const merged = mergeSyncCollection(local.assets || [], remote.assets || [], local.deleted || [], remote.deleted || [], "updatedAt");
+    return { assets: merged.items, deleted: merged.deleted };
+}
+
+function mergeLogData(local: LogDomainData, remote: LogDomainData): LogDomainData {
+    const merged = mergeSyncCollection(local.logs || [], remote.logs || [], local.deleted || [], remote.deleted || [], "createdAt", generationLogRank);
+    return { logs: merged.items, deleted: merged.deleted };
+}
+
+function mergeCanvasData(local: CanvasDomainData, remote: CanvasDomainData): CanvasDomainData {
+    const localDeleted = local.deleted || [];
+    const remoteDeleted = remote.deleted || [];
+    const deletedAtById = new Map<string, string>();
+    for (const item of [...remoteDeleted, ...localDeleted]) {
+        if (!item.id || !item.deletedAt) continue;
+        const current = deletedAtById.get(item.id);
+        if (!current || item.deletedAt >= current) deletedAtById.set(item.id, item.deletedAt);
+    }
+
+    const projects = mergeById(local.projects || [], remote.projects || [], "updatedAt").filter((project) => {
+        const deletedAt = deletedAtById.get(project.id);
+        if (!deletedAt) return true;
+        if (getTime(project as Record<string, unknown>, "updatedAt") > Date.parse(deletedAt)) {
+            deletedAtById.delete(project.id);
+            return true;
+        }
+        return false;
+    });
+
+    return {
+        projects,
+        deleted: [...deletedAtById.entries()].map(([id, deletedAt]) => ({ id, deletedAt })),
+    };
 }
 
 function mergeById<T extends { id?: string }>(local: T[], remote: T[], timeKey: string) {
@@ -380,7 +467,7 @@ function waitForHydration<T extends { hydrated: boolean }>(store: { getState: ()
 async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>) {
     const results = new Array<R>(items.length);
     let nextIndex = 0;
-    await Promise.all(
+    const settled = await Promise.allSettled(
         Array.from({ length: Math.min(limit, items.length) }, async () => {
             while (nextIndex < items.length) {
                 const index = nextIndex++;
@@ -388,6 +475,8 @@ async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item
             }
         }),
     );
+    const failed = settled.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
     return results;
 }
 

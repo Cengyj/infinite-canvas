@@ -23,7 +23,7 @@ From the browser side panel, the browser sends a turn to `/agent/codex/turn`. Ca
 
 ## Browser connection and state
 
-Canvas Agent listens on `http://127.0.0.1:17371` by default and generates a connection token. The browser opens an authenticated SSE connection:
+Canvas Agent listens on `http://127.0.0.1:17371` by default and generates a connection token. The browser opens an authenticated SSE connection. The EventSource query token is retained temporarily because native EventSource cannot set request headers:
 
 ```text
 GET /events?token=xxx&clientId=xxx
@@ -32,10 +32,13 @@ GET /events?token=xxx&clientId=xxx
 The browser pushes snapshots to:
 
 ```text
-POST /canvas/state?token=xxx&clientId=xxx
+POST /canvas/state?clientId=xxx
+X-Canvas-Agent-Token: xxx
 ```
 
 Snapshots contain the canvas ID and title, nodes, edges, selected node IDs, and viewport. Canvas Agent keeps the latest snapshot in memory, so tools read structured state rather than the DOM.
+
+Other browser-to-agent REST calls send `X-Canvas-Agent-Token: xxx` instead of putting the token in the URL.
 
 ## Applying operations
 

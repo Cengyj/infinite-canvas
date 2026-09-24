@@ -76,10 +76,10 @@ Codex -> MCP -> Canvas Agent -> 浏览器画布
 http://127.0.0.1:17371
 ```
 
-启动后会生成 `Connect token`，网页连接时必须携带 token。浏览器连接后会建立一条 SSE 长连接：
+启动后会生成 `Connect token`，网页连接时必须携带 token。由于原生 EventSource 不能设置请求头，浏览器建立 SSE 长连接时暂时仍把 token 放在 query 中：
 
 ```txt
-GET /events?token=xxx&clientId=xxx
+GET /events?token=xxx&clientId=xxx（EventSource 暂以 query token 认证）
 ```
 
 连接成功后，`Canvas Agent` 会发送 `hello` 事件，浏览器把状态更新为已连接。
@@ -89,7 +89,8 @@ GET /events?token=xxx&clientId=xxx
 浏览器会把当前画布快照主动同步给 `Canvas Agent`：
 
 ```txt
-POST /canvas/state?token=xxx&clientId=xxx
+POST /canvas/state?clientId=xxx
+X-Canvas-Agent-Token: xxx
 ```
 
 快照包含：

@@ -57,6 +57,43 @@ test("history metadata is matched by thread and turn instead of client message i
     assert.equal(message.skill, undefined);
 });
 
+test("reusing a live client message id never overwrites the original metadata or assets", async (context) => {
+    const fixture = await createFixture(context);
+    await fixture.store.recordPending("message-1", sampleMetadata());
+    await fixture.store.bindTurn("message-1", "thread-1", "turn-1");
+
+    await assert.rejects(
+        () => fixture.store.recordPending("message-1", { skill: { name: "replacement", path: "D:\\skills\\replacement\\SKILL.md" } }),
+        /already in use/,
+    );
+    const [message] = await fixture.reopen().mergeThread("thread-1", [{ role: "user", threadId: "thread-1", turnId: "turn-1" }]);
+    assert.equal(message.skill?.name, "product-grid");
+    const preview = message.attachments?.[0].url || "";
+    const match = preview.match(/^agent-asset:([a-f0-9]{64})\/([a-f0-9]{64}\.png)$/);
+    assert.ok(match);
+    assert.equal((await fixture.reopen().readAsset(match[1], match[2]))?.data.toString(), "a");
+});
+
+test("reusing a metadata id without new metadata is still rejected", async (context) => {
+    const fixture = await createFixture(context);
+    await fixture.store.recordPending("message-1", sampleMetadata());
+    await fixture.store.bindTurn("message-1", "thread-1", "turn-1");
+
+    await assert.rejects(() => fixture.store.recordPending("message-1", {}), /already in use/);
+    const messages = await fixture.reopen().mergeThread("thread-1", [
+        { role: "user", threadId: "thread-1", turnId: "turn-1" },
+        { role: "user", threadId: "thread-1", turnId: "turn-2" },
+    ]);
+    assert.equal(messages[0].skill?.name, "product-grid");
+    assert.equal(messages[1].skill, undefined);
+});
+
+test("oversized client message ids are rejected before writing previews", async (context) => {
+    const fixture = await createFixture(context);
+    await assert.rejects(() => fixture.store.recordPending("x".repeat(201), sampleMetadata()), /exceeds the limit of 200/);
+    assert.deepEqual(await fs.readdir(path.join(fixture.storeDirectory, "assets")), []);
+});
+
 test("unknown storage versions are never overwritten", async (context) => {
     const fixture = await createFixture(context, false);
     await fs.mkdir(fixture.storeDirectory, { recursive: true });

@@ -16,9 +16,9 @@ export const localForageStorage: StateStorage = {
     getItem: async (name) => {
         if (typeof window === "undefined") return null;
         try {
-            const value = (await localforage.getItem<string>(name)) || null;
+            const value = await localforage.getItem<string>(name);
             unreliableReads.delete(name);
-            return value;
+            return value || null;
         } catch {
             unreliableReads.add(name);
             return window.localStorage.getItem(name);

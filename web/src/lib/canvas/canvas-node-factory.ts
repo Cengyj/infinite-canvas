@@ -62,18 +62,6 @@ export function buildAudioGenerationMetadata(config: AiConfig): CanvasNodeMetada
     };
 }
 
-export function buildVideoGenerationMetadata(config: AiConfig, references: ReferenceImage[] = []): CanvasNodeMetadata {
-    return {
-        model: config.model,
-        size: config.size,
-        seconds: config.videoSeconds,
-        vquality: config.vquality,
-        generateAudio: config.videoGenerateAudio,
-        watermark: config.videoWatermark,
-        references: references.map(referenceUrl).filter((url): url is string => Boolean(url)),
-    };
-}
-
 export function applyNodeConfigPatch(node: CanvasNodeData, patch: Partial<CanvasNodeData["metadata"]>) {
     const safePatch = patch || {};
     const next = { ...node, metadata: { ...node.metadata, ...safePatch } };
