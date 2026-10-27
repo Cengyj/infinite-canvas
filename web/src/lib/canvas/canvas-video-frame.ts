@@ -1,7 +1,4 @@
-import { withLocalProxy } from "@/stores/use-config-store";
-
 export type VideoFramePosition = "first" | "last" | "current";
-const VIDEO_FRAME_TIMEOUT_MS = 30_000;
 
 export async function captureVideoFrame(source: string, position: VideoFramePosition, currentTime: number) {
     const video = document.createElement("video");
@@ -11,7 +8,7 @@ export async function captureVideoFrame(source: string, position: VideoFramePosi
     video.preload = "auto";
     try {
         const metadataLoaded = waitForVideo(video, "loadedmetadata");
-        video.src = withLocalProxy(source);
+        video.src = source;
         video.load();
 
         await metadataLoaded;
@@ -38,22 +35,17 @@ export async function captureVideoFrame(source: string, position: VideoFramePosi
 
 function waitForVideo(video: HTMLVideoElement, eventName: "loadedmetadata" | "loadeddata" | "seeked") {
     return new Promise<void>((resolve, reject) => {
-        let timer = 0;
-        const cleanup = () => {
-            window.clearTimeout(timer);
+        const finish = () => {
             video.removeEventListener(eventName, finish);
             video.removeEventListener("error", fail);
-        };
-        const finish = () => {
-            cleanup();
             resolve();
         };
         const fail = () => {
-            cleanup();
+            video.removeEventListener(eventName, finish);
+            video.removeEventListener("error", fail);
             reject(new Error("Failed to read video frame"));
         };
         video.addEventListener(eventName, finish);
         video.addEventListener("error", fail);
-        timer = window.setTimeout(fail, VIDEO_FRAME_TIMEOUT_MS);
     });
 }

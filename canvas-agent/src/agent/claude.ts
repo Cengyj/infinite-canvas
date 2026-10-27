@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 
 import { AGENT_PROMPT } from "../config.js";
-import { createAgentLogWriter, redactAgentLog } from "../utils/agent-runtime.js";
+import { createAgentLogWriter } from "../utils/agent-runtime.js";
 import { errorMessage } from "../utils/value.js";
 import type { AgentEmit } from "./types.js";
 
@@ -21,26 +21,26 @@ function withAgentPrompt(prompt: string) {
 /** 将 Claude CLI 的 JSON Lines 输出转换为 Agent 事件。 */
 function pipeJsonLines(child: ReturnType<typeof spawn>, emit: AgentEmit, agent: string) {
     let out = "";
+    const stderr = createAgentLogWriter((text) => emit("agent_log", { text }));
     child.stdout?.on("data", (chunk) => {
         out += chunk.toString();
         const lines = out.split(/\r?\n/);
         out = lines.pop() || "";
         lines.filter(Boolean).forEach((line) => {
             try {
-                emit("agent_event", { ...JSON.parse(line), agent });
+                emit("agent_event", { agent, ...JSON.parse(line) });
             } catch {
                 emit("agent_event", { agent, type: "raw", text: line });
             }
         });
     });
-    const logWriter = createAgentLogWriter((text) => emit("agent_log", { text }));
-    child.stderr?.on("data", (chunk) => logWriter.write(chunk.toString()));
+    child.stderr?.on("data", (chunk) => stderr.write(chunk.toString()));
     child.on("error", (error) => {
-        logWriter.flush();
-        emit("agent_error", { message: redactAgentLog(error.message) });
+        stderr.flush();
+        emit("agent_error", { message: error.message });
     });
     child.on("close", (code) => {
-        logWriter.flush();
+        stderr.flush();
         emit("agent_done", { agent, code });
     });
 }
@@ -50,7 +50,7 @@ function spawnAgent(name: string, args: string[], emit: AgentEmit) {
     try {
         return spawn(name, args, { stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32", windowsHide: true });
     } catch (error) {
-        emit("agent_error", { message: redactAgentLog(errorMessage(error)) });
+        emit("agent_error", { message: errorMessage(error) });
         return null;
     }
 }

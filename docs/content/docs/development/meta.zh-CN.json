@@ -5,6 +5,7 @@
   "pages": [
     "local-development",
     "canvas-data-structure",
+    "prompt-optimization",
     "local-codex-canvas"
   ]
 }

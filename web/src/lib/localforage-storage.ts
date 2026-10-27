@@ -6,21 +6,12 @@ localforage.config({
     storeName: "app_state",
 });
 
-const unreliableReads = new Set<string>();
-
-export function isLocalForageStorageReadReliable(name: string) {
-    return !unreliableReads.has(name);
-}
-
 export const localForageStorage: StateStorage = {
     getItem: async (name) => {
         if (typeof window === "undefined") return null;
         try {
-            const value = await localforage.getItem<string>(name);
-            unreliableReads.delete(name);
-            return value || null;
+            return (await localforage.getItem<string>(name)) || null;
         } catch {
-            unreliableReads.add(name);
             return window.localStorage.getItem(name);
         }
     },

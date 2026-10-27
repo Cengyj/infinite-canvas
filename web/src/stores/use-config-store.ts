@@ -54,6 +54,8 @@ export type AiConfig = {
     canvasImageCount: string;
     proxyEnabled: boolean;
     proxyUrl: string;
+    nodeRegenerateBehavior: "new-node" | "overwrite";
+    autoFocusOnSelect: boolean;
 };
 
 export type WebdavSyncConfig = {
@@ -71,10 +73,9 @@ export type ChannelCredentialsImportResult = {
 };
 
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
-const CONFIG_STORE_VERSION = 1;
 const CHANNEL_MODEL_SEPARATOR = "::";
 const OPENAI_BASE_URL = "https://direct.foropencode.com";
-const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
+const GEMINI_BASE_URL = "https://direct.foropencode.com";
 export const LOCAL_PROXY_PACKAGE = "@basketikun/canvas-proxy";
 export const DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:23210";
 
@@ -92,19 +93,20 @@ export const defaultConfig: AiConfig = {
             apiFormat: "openai",
             models: [
                 { name: "gpt-image-2", capability: "image" },
+                { name: "gpt-image-2.5", capability: "image" },
+                { name: "gpt-image-2.5-sunburst", capability: "image" },
                 { name: "grok-imagine-video", capability: "video" },
-                { name: "gpt-6-sol", capability: "text" },
-                { name: "gpt-4o-mini-tts", capability: "audio" },
+                { name: "grok-imagine-video-1.5", capability: "video" },
+                { name: "gpt-6.1-sol", capability: "text" },
             ],
         },
         {
             id: "google",
             name: "Google",
-            baseUrl: OPENAI_BASE_URL,
+            baseUrl: GEMINI_BASE_URL,
             apiKey: "",
             apiFormat: "gemini",
             models: [
-                { name: "gemini-2.5-flash-image-preview", capability: "image" },
                 { name: "gemini-3-pro-image-preview", capability: "image" },
                 { name: "gemini-3.1-flash-image-preview", capability: "image" },
             ],
@@ -113,8 +115,8 @@ export const defaultConfig: AiConfig = {
     model: "default::gpt-image-2",
     imageModel: "default::gpt-image-2",
     videoModel: "default::grok-imagine-video",
-    textModel: "default::gpt-6-sol",
-    audioModel: "default::gpt-4o-mini-tts",
+    textModel: "default::gpt-6.1-sol",
+    audioModel: "",
     audioVoice: "alloy",
     audioFormat: "mp3",
     audioSpeed: "1",
@@ -128,10 +130,11 @@ export const defaultConfig: AiConfig = {
     reasoningEffort: "auto",
     models: [
         "default::gpt-image-2",
+        "default::gpt-image-2.5",
+        "default::gpt-image-2.5-sunburst",
         "default::grok-imagine-video",
-        "default::gpt-6-sol",
-        "default::gpt-4o-mini-tts",
-        "google::gemini-2.5-flash-image-preview",
+        "default::grok-imagine-video-1.5",
+        "default::gpt-6.1-sol",
         "google::gemini-3-pro-image-preview",
         "google::gemini-3.1-flash-image-preview",
     ],
@@ -142,6 +145,8 @@ export const defaultConfig: AiConfig = {
     canvasImageCount: "3",
     proxyEnabled: false,
     proxyUrl: DEFAULT_LOCAL_PROXY_URL,
+    nodeRegenerateBehavior: "new-node",
+    autoFocusOnSelect: false,
 };
 
 export const defaultWebdavSyncConfig: WebdavSyncConfig = {
@@ -161,7 +166,6 @@ type ConfigStore = {
     updateConfig: <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
     importChannelCredentials: (input: { baseUrl?: string | null; apiKey?: string | null }) => ChannelCredentialsImportResult;
     updateWebdavConfig: <K extends keyof WebdavSyncConfig>(key: K, value: WebdavSyncConfig[K]) => void;
-    replaceConfig: (config: Partial<AiConfig>, webdav?: Partial<WebdavSyncConfig>) => void;
     isAiConfigReady: (config: AiConfig, model: string) => boolean;
     openConfigDialog: (shouldPromptContinue?: boolean, tab?: ConfigTabKey) => void;
     setConfigDialogOpen: (isOpen: boolean) => void;
@@ -205,10 +209,14 @@ export function modelMatchesCapability(config: AiConfig, value: string, capabili
 export function resolveModelForCapability(config: AiConfig, currentModel: string | undefined, capability: ModelCapability) {
     const defaultModel = capability === "image" ? config.imageModel : capability === "video" ? config.videoModel : capability === "audio" ? config.audioModel : config.textModel;
     const fallbackModel = capability === "image" ? defaultConfig.imageModel : capability === "video" ? defaultConfig.videoModel : capability === "audio" ? defaultConfig.audioModel : defaultConfig.textModel;
-    if (currentModel && modelMatchesCapability(config, currentModel, capability)) return currentModel;
-    if (defaultModel && modelMatchesCapability(config, defaultModel, capability)) return defaultModel;
-    if (fallbackModel && modelMatchesCapability(config, fallbackModel, capability)) return fallbackModel;
-    return selectableModelsByCapability(config, capability)[0] || "";
+    for (const model of [currentModel, defaultModel]) {
+        if (!model) continue;
+        const configuredCapability = modelCapabilityOf(config, model);
+        // Keep unavailable selections visible so the readiness check blocks the
+        // request. Only a known capability switch may choose another model.
+        if (!configuredCapability || configuredCapability === capability) return model;
+    }
+    return fallbackModel;
 }
 
 export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
@@ -222,8 +230,8 @@ export function resolveModelScript(config: AiConfig, value: string) {
 }
 
 function isAiConfigReady(config: AiConfig, model: string) {
-    const channel = resolveModelChannel(config, model);
-    return Boolean(model.trim() && channel.baseUrl.trim() && channel.apiKey.trim());
+    const match = findChannelModel(config, model);
+    return Boolean(match && match.channel.baseUrl.trim() && match.channel.apiKey.trim());
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -254,11 +262,6 @@ export const useConfigStore = create<ConfigStore>()(
                         [key]: value,
                     },
                 })),
-            replaceConfig: (config, webdav) =>
-                set((state) => ({
-                    config: normalizeAiConfig(config),
-                    webdav: webdav ? normalizeWebdavSyncConfig(webdav) : state.webdav,
-                })),
             isAiConfigReady: (config, model) => isAiConfigReady(config, model),
             openConfigDialog: (shouldPromptContinue = false, configTab = "channels") => set({ isConfigOpen: true, shouldPromptContinue, configTab }),
             setConfigDialogOpen: (isConfigOpen) => set({ isConfigOpen }),
@@ -266,107 +269,49 @@ export const useConfigStore = create<ConfigStore>()(
         }),
         {
             name: CONFIG_STORE_KEY,
-            version: CONFIG_STORE_VERSION,
-            migrate: (persisted, version) => {
-                if (version !== 0) throw new Error(`Unsupported config store version: ${version}`);
-                return persisted as Pick<ConfigStore, "config" | "webdav">;
-            },
             partialize: (state) => ({ config: state.config, webdav: state.webdav }),
             merge: (persisted, current) => {
                 const persistedState = (persisted || {}) as Partial<ConfigStore>;
+                const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
+                const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
+                const config = { ...defaultConfig, ...persistedConfig };
+                if (persistedState.config && !Array.isArray(persistedConfig.channels)) config.channels = [];
+                const channels = normalizeChannels(config);
+                const models = modelOptionsFromChannels(channels);
                 return {
                     ...current,
-                    config: normalizeAiConfig(persistedState.config),
-                    webdav: normalizeWebdavSyncConfig(persistedState.webdav),
+                    webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
+                    config: {
+                        ...config,
+                        channelMode: "local",
+                        apiFormat: normalizeApiFormat(config.apiFormat),
+                        channels,
+                        models,
+                        imageModel: normalizeModelOptionValue(config.imageModel || config.model, channels),
+                        videoModel: normalizeModelOptionValue(config.videoModel, channels),
+                        textModel: normalizeModelOptionValue(config.textModel || config.model, channels),
+                        audioModel: normalizeModelOptionValue(config.audioModel || defaultConfig.audioModel, channels),
+                        audioVoice: config.audioVoice || defaultConfig.audioVoice,
+                        audioFormat: config.audioFormat || defaultConfig.audioFormat,
+                        audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
+                        audioInstructions: config.audioInstructions || "",
+                        reasoningEffort: config.reasoningEffort || "auto",
+                        videoSeconds: config.videoSeconds || "6",
+                        vquality: config.vquality || "720",
+                        videoGenerateAudio: config.videoGenerateAudio || "true",
+                        videoWatermark: config.videoWatermark || "false",
+                        videoMode: config.videoMode === "reference" ? "reference" : "frames",
+                        canvasImageCount: config.canvasImageCount || "3",
+                        proxyEnabled: Boolean(config.proxyEnabled),
+                        proxyUrl: config.proxyUrl || DEFAULT_LOCAL_PROXY_URL,
+                        nodeRegenerateBehavior: config.nodeRegenerateBehavior === "overwrite" ? "overwrite" : "new-node",
+                        autoFocusOnSelect: Boolean(config.autoFocusOnSelect),
+                    },
                 };
             },
         },
     ),
 );
-
-export function normalizeAiConfig(persistedConfig?: Partial<AiConfig>): AiConfig {
-    const hasPersistedConfig = Boolean(persistedConfig && typeof persistedConfig === "object" && !Array.isArray(persistedConfig));
-    const raw = hasPersistedConfig ? (persistedConfig as Record<string, unknown>) : {};
-    const config = { ...defaultConfig, ...raw } as AiConfig;
-    const hasPersistedChannels = Object.prototype.hasOwnProperty.call(raw, "channels");
-    const hasValidPersistedChannels = Array.isArray(raw.channels);
-    if (hasPersistedChannels) config.channels = hasValidPersistedChannels ? (raw.channels as ModelChannel[]) : [];
-    else if (hasPersistedConfig) config.channels = [];
-    if (Object.prototype.hasOwnProperty.call(raw, "models")) config.models = Array.isArray(raw.models) ? raw.models.filter((model): model is string => typeof model === "string") : [];
-    else if (hasPersistedConfig && !hasPersistedChannels) config.models = [];
-    const stringDefaults: Array<[keyof AiConfig, string]> = [
-        ["baseUrl", defaultConfig.baseUrl],
-        ["apiKey", defaultConfig.apiKey],
-        ["model", defaultConfig.model],
-        ["imageModel", defaultConfig.imageModel],
-        ["videoModel", defaultConfig.videoModel],
-        ["textModel", defaultConfig.textModel],
-        ["audioModel", defaultConfig.audioModel],
-        ["audioVoice", defaultConfig.audioVoice],
-        ["audioFormat", defaultConfig.audioFormat],
-        ["audioSpeed", defaultConfig.audioSpeed],
-        ["audioInstructions", defaultConfig.audioInstructions],
-        ["videoSeconds", defaultConfig.videoSeconds],
-        ["vquality", defaultConfig.vquality],
-        ["videoGenerateAudio", defaultConfig.videoGenerateAudio],
-        ["videoWatermark", defaultConfig.videoWatermark],
-        ["videoMode", defaultConfig.videoMode],
-        ["systemPrompt", defaultConfig.systemPrompt],
-        ["quality", defaultConfig.quality],
-        ["size", defaultConfig.size],
-        ["background", defaultConfig.background],
-        ["count", defaultConfig.count],
-        ["canvasImageCount", defaultConfig.canvasImageCount],
-        ["proxyUrl", defaultConfig.proxyUrl],
-    ];
-    for (const [key, fallback] of stringDefaults) {
-        if (typeof config[key] !== "string") (config[key] as unknown as string) = fallback;
-    }
-    if (hasPersistedConfig && !hasPersistedChannels) {
-        for (const key of ["model", "imageModel", "videoModel", "textModel", "audioModel"] as const) {
-            if (typeof raw[key] !== "string") config[key] = "";
-        }
-    }
-    config.proxyEnabled = typeof config.proxyEnabled === "boolean" ? config.proxyEnabled : defaultConfig.proxyEnabled;
-    config.reasoningEffort = ["auto", "low", "medium", "high", "xhigh"].includes(config.reasoningEffort as string) ? config.reasoningEffort : defaultConfig.reasoningEffort;
-    const channels = normalizeChannels(config, hasPersistedConfig && !hasPersistedChannels);
-    const imageModel = normalizeDefaultModel(config.imageModel || config.model, channels, "image");
-    return {
-        ...config,
-        channelMode: "local",
-        apiFormat: normalizeApiFormat(config.apiFormat),
-        channels,
-        models: modelOptionsFromChannels(channels),
-        model: imageModel,
-        imageModel,
-        videoModel: normalizeDefaultModel(config.videoModel, channels, "video"),
-        textModel: normalizeDefaultModel(config.textModel || config.model, channels, "text"),
-        audioModel: normalizeDefaultModel(config.audioModel || defaultConfig.audioModel, channels, "audio"),
-        audioVoice: config.audioVoice || defaultConfig.audioVoice,
-        audioFormat: config.audioFormat || defaultConfig.audioFormat,
-        audioSpeed: config.audioSpeed || defaultConfig.audioSpeed,
-        audioInstructions: config.audioInstructions || "",
-        reasoningEffort: config.reasoningEffort || "auto",
-        videoSeconds: config.videoSeconds || "6",
-        vquality: config.vquality || "720",
-        videoGenerateAudio: config.videoGenerateAudio || "true",
-        videoWatermark: config.videoWatermark || "false",
-        videoMode: config.videoMode === "reference" ? "reference" : "frames",
-        canvasImageCount: config.canvasImageCount || "3",
-        proxyEnabled: Boolean(config.proxyEnabled),
-        proxyUrl: config.proxyUrl || DEFAULT_LOCAL_PROXY_URL,
-    };
-}
-
-export function normalizeWebdavSyncConfig(config?: Partial<WebdavSyncConfig>): WebdavSyncConfig {
-    return {
-        url: typeof config?.url === "string" ? config.url : defaultWebdavSyncConfig.url,
-        username: typeof config?.username === "string" ? config.username : defaultWebdavSyncConfig.username,
-        password: typeof config?.password === "string" ? config.password : defaultWebdavSyncConfig.password,
-        directory: typeof config?.directory === "string" ? config.directory : defaultWebdavSyncConfig.directory,
-        lastSyncedAt: typeof config?.lastSyncedAt === "string" ? config.lastSyncedAt : defaultWebdavSyncConfig.lastSyncedAt,
-    };
-}
 
 export function useEffectiveConfig() {
     const config = useConfigStore((state) => state.config);
@@ -377,15 +322,12 @@ export function useEffectiveConfig() {
 export function normalizeChannelModels(models: Array<string | ChannelModel> | undefined): ChannelModel[] {
     const seen = new Set<string>();
     const result: ChannelModel[] = [];
-    for (const item of Array.isArray(models) ? models : []) {
-        const raw = typeof item === "object" && item !== null ? (item as Record<string, unknown>) : undefined;
-        const rawName = typeof item === "string" ? item : raw?.name;
-        const name = typeof rawName === "string" ? rawName.trim() : "";
+    for (const item of models || []) {
+        const name = (typeof item === "string" ? item : item?.name || "").trim();
         if (!name || seen.has(name)) continue;
         seen.add(name);
-        const rawCapability = raw?.capability;
-        const capability = rawCapability === "image" || rawCapability === "video" || rawCapability === "text" || rawCapability === "audio" ? rawCapability : guessCapability(name);
-        const script = typeof raw?.script === "string" ? raw.script.trim() || undefined : undefined;
+        const capability = typeof item === "string" ? guessCapability(name) : item.capability || guessCapability(name);
+        const script = typeof item === "string" ? undefined : item.script?.trim() || undefined;
         result.push({ name, capability, script });
     }
     return result;
@@ -393,17 +335,13 @@ export function normalizeChannelModels(models: Array<string | ChannelModel> | un
 
 export function createModelChannel(channel?: Partial<ModelChannel>): ModelChannel {
     const apiFormat = normalizeApiFormat(channel?.apiFormat);
-    const id = typeof channel?.id === "string" ? channel.id.trim() : "";
-    const name = typeof channel?.name === "string" ? channel.name.trim() : "";
-    const baseUrl = typeof channel?.baseUrl === "string" ? channel.baseUrl.trim() : "";
-    const apiKey = typeof channel?.apiKey === "string" ? channel.apiKey : "";
     return {
-        id: id || nanoid(),
-        name: name || i18n.t("config.channels.newName"),
-        baseUrl: baseUrl || defaultBaseUrlForApiFormat(apiFormat),
-        apiKey,
+        id: channel?.id?.trim() || nanoid(),
+        name: channel?.name?.trim() || i18n.t("config.channels.newName"),
+        baseUrl: channel?.baseUrl?.trim() ?? defaultBaseUrlForApiFormat(apiFormat),
+        apiKey: channel?.apiKey || "",
         apiFormat,
-        models: normalizeChannelModels(Array.isArray(channel?.models) ? channel.models : []),
+        models: normalizeChannelModels(channel?.models),
     };
 }
 
@@ -450,19 +388,20 @@ function isHttpBaseUrl(baseUrl: string) {
 
 function normalizedBaseUrlKey(baseUrl: string) {
     try {
-        const url = new URL(normalizeImportedBaseUrl(baseUrl));
-        url.pathname = url.pathname.replace(/\/v1$/i, "");
-        return url.toString();
+        return stripTrailingApiVersion(normalizeImportedBaseUrl(baseUrl));
     } catch {
-        return baseUrl.trim();
+        return stripTrailingApiVersion(baseUrl.trim().replace(/\/+$/, ""));
     }
 }
 
 function normalizeImportedBaseUrl(baseUrl: string) {
     const url = new URL(baseUrl.trim());
-    url.pathname = url.pathname.replace(/\/+$/, "");
     url.hash = "";
-    return url.toString();
+    return url.toString().replace(/\/+$/, "");
+}
+
+function stripTrailingApiVersion(baseUrl: string) {
+    return baseUrl.replace(/\/v1$/i, "");
 }
 
 function importedChannelName(baseUrl: string) {
@@ -499,14 +438,35 @@ export function modelOptionsFromChannels(channels: ModelChannel[]) {
     return uniqueModelOptions(channels.flatMap((channel) => channel.models.map((model) => encodeChannelModel(channel.id, model.name))));
 }
 
+export function withChannels(config: AiConfig, channels: ModelChannel[]): AiConfig {
+    const next: AiConfig = {
+        ...config,
+        channels,
+        models: modelOptionsFromChannels(channels),
+        baseUrl: channels[0]?.baseUrl || config.baseUrl,
+        apiKey: channels[0]?.apiKey || config.apiKey,
+        apiFormat: channels[0]?.apiFormat || config.apiFormat,
+    };
+    return {
+        ...next,
+        imageModel: pickDefaultModel(next, "image", config.imageModel),
+        videoModel: pickDefaultModel(next, "video", config.videoModel),
+        textModel: pickDefaultModel(next, "text", config.textModel),
+        audioModel: pickDefaultModel(next, "audio", config.audioModel),
+    };
+}
+
+function pickDefaultModel(config: AiConfig, capability: ModelCapability, current: string) {
+    const normalized = normalizeModelOptionValue(current, config.channels);
+    if (normalized && !modelCapabilityOf(config, normalized)) return normalized;
+    const options = selectableModelsByCapability(config, capability);
+    return options.includes(normalized) ? normalized : options[0] || "";
+}
+
 export function normalizeModelOptionValue(value: string | undefined, channels: ModelChannel[]) {
     const model = (value || "").trim();
     if (!model) return "";
-    const decoded = decodeChannelModel(model);
-    if (decoded) {
-        const channel = channels.find((item) => item.id === decoded.channelId);
-        return channel && channel.models.some((item) => item.name === decoded.model) ? model : "";
-    }
+    if (decodeChannelModel(model)) return model;
     const channel = channels.find((item) => item.models.some((entry) => entry.name === model)) || channels[0];
     return channel && channel.models.some((item) => item.name === model) ? encodeChannelModel(channel.id, model) : model;
 }
@@ -529,39 +489,16 @@ export function resolveModelRequestConfig(config: AiConfig, value: string) {
     };
 }
 
-function normalizeChannels(config: AiConfig, allowLegacyFallback = true) {
-    const persistedChannels = Array.isArray(config.channels) ? config.channels : [];
-    const channels = persistedChannels.flatMap((value, index) => {
-        if (!value || typeof value !== "object" || Array.isArray(value)) return [];
-        const channel = value as Partial<ModelChannel>;
-        return [
-            createModelChannel({
-                ...channel,
-                id: channel.id || (index === 0 ? "default" : `channel-${index + 1}`),
-                name: channel.name || (index === 0 ? i18n.t("config.channels.defaultName") : i18n.t("config.channels.indexedName", { index: index + 1 })),
-                models: normalizeChannelModels(channel.models),
-            }),
-        ];
-    });
-    if (!channels.length && allowLegacyFallback) {
-        channels.push(
-            createModelChannel({
-                id: "default",
-                name: i18n.t("config.channels.defaultName"),
-                baseUrl: config.baseUrl || defaultConfig.baseUrl,
-                apiKey: config.apiKey || "",
-                apiFormat: config.apiFormat || defaultConfig.apiFormat,
-                models: normalizeChannelModels([...config.models, config.model, config.imageModel, config.videoModel, config.textModel, config.audioModel].map(modelOptionName)),
-            }),
-        );
-    }
-    return channels;
-}
-
-function normalizeDefaultModel(value: string | undefined, channels: ModelChannel[], capability: ModelCapability) {
-    const options = channels.flatMap((channel) => channel.models.filter((model) => model.capability === capability).map((model) => encodeChannelModel(channel.id, model.name)));
-    const normalized = normalizeModelOptionValue(value, channels);
-    return options.includes(normalized) ? normalized : options[0] || "";
+function normalizeChannels(config: AiConfig) {
+    const channels = Array.isArray(config.channels) ? config.channels : [];
+    return channels.map((channel, index) =>
+        createModelChannel({
+            ...channel,
+            id: channel.id || (index === 0 ? "default" : `channel-${index + 1}`),
+            name: channel.name || (index === 0 ? i18n.t("config.channels.defaultName") : i18n.t("config.channels.indexedName", { index: index + 1 })),
+            models: normalizeChannelModels(channel.models),
+        }),
+    );
 }
 
 export function defaultBaseUrlForApiFormat(apiFormat: ApiCallFormat) {
@@ -577,38 +514,11 @@ function uniqueModelOptions(models: string[]) {
     return Array.from(new Set((models || []).map((model) => model.trim()).filter(Boolean)));
 }
 
-/** Join an API path before query/hash components instead of appending after them. */
-export function appendUrlPath(baseUrl: string, path: string) {
-    const base = new URL(baseUrl);
-    const suffix = new URL(path, base.origin);
-    const basePath = base.pathname.replace(/\/+$/, "");
-    const suffixPath = suffix.pathname.replace(/^\/+/, "");
-    base.pathname = `${basePath}/${suffixPath}` || "/";
-    if (suffix.search) {
-        const params = new URLSearchParams(base.search);
-        suffix.searchParams.forEach((value, key) => params.append(key, value));
-        base.search = params.toString();
-    }
-    // A fragment is client-side state and must never be sent as part of an API URL.
-    base.hash = "";
-    return base.toString();
-}
-
-export function buildApiUrl(baseUrl: string, path: string, apiVersion: "v1" | "v1beta" = "v1") {
-    const rawBaseUrl = typeof baseUrl === "string" ? baseUrl.trim() : "";
-    try {
-        const base = new URL(rawBaseUrl);
-        base.hash = "";
-        const pathname = base.pathname.replace(/\/+$/, "");
-        if (!/\/v1(?:beta)?$/i.test(pathname)) base.pathname = `${pathname}/${apiVersion}` || `/${apiVersion}`;
-        return withLocalProxy(appendUrlPath(base.toString(), path));
-    } catch {
-        // Keep the previous behavior for an invalid/incomplete URL; validation will report it upstream.
-        const normalizedBaseUrl = rawBaseUrl.replace(/\/+$/, "");
-        const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
-        const apiBaseUrl = lowerBaseUrl.endsWith("/v1") || lowerBaseUrl.endsWith("/v1beta") ? normalizedBaseUrl : `${normalizedBaseUrl}/${apiVersion}`;
-        return withLocalProxy(`${apiBaseUrl}${path}`);
-    }
+export function buildApiUrl(baseUrl: string, path: string) {
+    const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+    const lowerBaseUrl = normalizedBaseUrl.toLowerCase();
+    const apiBaseUrl = lowerBaseUrl.endsWith("/v1") ? normalizedBaseUrl : `${normalizedBaseUrl}/v1`;
+    return withLocalProxy(`${apiBaseUrl}${path}`);
 }
 
 export function normalizeLocalProxyUrl(value: string) {
@@ -617,33 +527,11 @@ export function normalizeLocalProxyUrl(value: string) {
     return /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
 }
 
-/** Accept absolute and protocol-relative HTTP URLs without treating data/blob URLs as proxy targets. */
-export function isHttpUrl(value: string) {
-    return /^https?:\/\//i.test(value) || /^\/\/[^/]/.test(value);
-}
-
-/** Resolve a protocol-relative target only when a browser page can provide its protocol. */
-export function normalizeProxyTargetUrl(value: string) {
-    if (!/^\/\/[^/]/.test(value)) return value;
-    const protocol = typeof window !== "undefined" ? window.location?.protocol || "" : "";
-    return /^https?:$/i.test(protocol) ? `${protocol}${value}` : value;
-}
-
 /** Prefix an outgoing request with the local forwarding proxy so the browser is not blocked by CORS. */
 export function withLocalProxy(url: string) {
     const { proxyEnabled, proxyUrl } = useConfigStore.getState().config;
-    const targetUrl = normalizeProxyTargetUrl(url);
-    if (!proxyEnabled || !/^https?:\/\//i.test(targetUrl)) return url;
+    if (!proxyEnabled || !/^https?:\/\//i.test(url)) return url;
     const base = normalizeLocalProxyUrl(proxyUrl);
-    if (!base || targetUrl === base || targetUrl.startsWith(`${base}/`)) return targetUrl;
-    return `${base}/${targetUrl}`;
-}
-
-/** Whether a request URL is already addressed to the configured local proxy. */
-export function isLocalProxyUrl(url: string) {
-    const { proxyEnabled, proxyUrl } = useConfigStore.getState().config;
-    const targetUrl = normalizeProxyTargetUrl(url);
-    if (!proxyEnabled || !/^https?:\/\//i.test(targetUrl)) return false;
-    const base = normalizeLocalProxyUrl(proxyUrl);
-    return Boolean(base && (targetUrl === base || targetUrl.startsWith(`${base}/`)));
+    if (!base || url.startsWith(`${base}/`)) return url;
+    return `${base}/${url}`;
 }

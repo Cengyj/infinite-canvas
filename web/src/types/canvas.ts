@@ -74,7 +74,6 @@ export type CanvasNodeMetadata = {
     references?: string[];
     naturalWidth?: number;
     naturalHeight?: number;
-    aspectRatio?: string;
     freeResize?: boolean;
     images?: CanvasNodeImage[];
     primaryImageId?: string;

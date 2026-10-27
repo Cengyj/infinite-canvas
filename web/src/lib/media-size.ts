@@ -35,8 +35,6 @@ export function parseAspectRatio(value: string) {
 
 export const videoRatioOptions = [
     { value: "1:1", width: 1, height: 1 },
-    { value: "2:3", width: 2, height: 3 },
-    { value: "3:2", width: 3, height: 2 },
     { value: "3:4", width: 3, height: 4 },
     { value: "4:3", width: 4, height: 3 },
     { value: "16:9", width: 16, height: 9 },
@@ -139,6 +137,28 @@ export function computeVideoSize(resolution: string, ratio: string) {
     const width = evenRound(landscape ? (p * parsed.width) / parsed.height : p);
     const height = evenRound(landscape ? p : (p * parsed.height) / parsed.width);
     return `${width}x${height}`;
+}
+
+export function resolveVideoMode(mode: string | undefined, imageCount: number) {
+    return mode === "reference" || imageCount > 2 ? "reference" : "frames";
+}
+
+export function normalizeVideoRequestSize(value: string, resolution?: string) {
+    if (value === "auto") return null;
+    if (/^\d+x\d+$/.test(value || "")) return value;
+    const ratio = inferVideoRatio(value || "16:9");
+    return ratio === "auto" ? null : computeVideoSize(resolution || "720", ratio);
+}
+
+export function normalizeVideoRequestResolution(value: string) {
+    if (value === "low") return "480p";
+    if (value === "auto" || value === "high" || value === "medium") return "720p";
+    return `${value.replace(/p$/i, "") || "720"}p`;
+}
+
+export function videoRequestAspectRatio(size: string) {
+    const ratio = inferVideoRatio(size);
+    return ratio === "auto" ? "16:9" : ratio;
 }
 
 export function readVideoDimensions(size: string, resolution: string, ratio: string) {

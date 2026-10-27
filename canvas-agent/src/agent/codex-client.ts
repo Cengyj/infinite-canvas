@@ -2,8 +2,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { createAgentLogWriter } from "../utils/agent-runtime.js";
 import { VERSION } from "../config.js";
-import { createAgentLogWriter, redactAgentLog } from "../utils/agent-runtime.js";
 import { logger } from "../utils/logger.js";
 import { field, type JsonRecord } from "../utils/value.js";
 import { codexEventHistory, type CodexEventHistory } from "./codex-event-history.js";
@@ -69,10 +70,6 @@ export class CodexAppClient {
         logger.info("Starting Codex app-server", { executable: process.execPath, codex: codexBin() });
         const child = spawn(process.execPath, [codexBin(), "app-server", "--stdio"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
         const client = new CodexAppClient(child, emit);
-        const logWriter = createAgentLogWriter((text) => {
-            logger.warn("Codex app-server stderr", { text });
-            emit("agent_log", { text });
-        }, (text) => text.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+/, ""));
         let stopped = false;
         const stop = () => {
             if (stopped) return;
@@ -80,23 +77,23 @@ export class CodexAppClient {
             onExit();
         };
         child.stdout?.on("data", (chunk) => client.read(chunk.toString()));
+        const stderr = createAgentLogWriter((text) => {
+            logger.warn("Codex app-server stderr", { text });
+            emit("agent_log", { text });
+        }, (text) => text.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+/, ""));
         child.stderr?.on("data", (chunk) => {
-            if (client.skillDraftActive) {
-                logWriter.clear();
-                return;
-            }
-            logWriter.write(chunk.toString());
+            if (client.skillDraftActive) return stderr.clear();
+            stderr.write(chunk.toString());
         });
         child.on("error", (error) => {
-            logWriter.flush();
+            stderr.flush();
             logger.error("Codex app-server process error", error);
             emit("agent_error", { message: error.message });
             client.failAll(error.message, true);
             stop();
         });
         child.on("exit", (code) => {
-            if (client.skillDraftActive) logWriter.clear();
-            else logWriter.flush();
+            stderr.flush();
             logger.warn("Codex app-server exited", { code });
             client.failAll(`Codex app-server exited: ${code ?? 0}`);
             stop();
@@ -342,9 +339,8 @@ export class CodexAppClient {
                 this.handle(JSON.parse(line) as JsonRecord);
             } catch (error) {
                 if (!this.skillDraftActive) {
-                    const safeLine = redactAgentLog(line);
-                    logger.warn("Invalid Codex app-server output", { error, line: safeLine });
-                    this.emit("agent_log", { text: safeLine });
+                    logger.warn("Invalid Codex app-server output", { error, line });
+                    this.emit("agent_log", { text: line });
                 }
             }
         });
@@ -354,7 +350,7 @@ export class CodexAppClient {
     private handle(message: JsonRecord) {
         const id = Number(message.id);
         if (message.error && this.pending.has(id)) {
-            const error = redactAgentLog(String(field(message.error, "message") || "Codex request failed"));
+            const error = String(field(message.error, "message") || "Codex request failed");
             if (!this.pending.get(id)?.silent) {
                 if (/not materialized yet.*includeTurns/i.test(error)) logger.debug("Codex thread has no messages yet", { id });
                 else logger.warn("Codex request failed", { id, error });

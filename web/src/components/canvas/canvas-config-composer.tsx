@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent, PointerEvent } from "react";
 import { Button, Image } from "antd";
-import { FileText, Group, Image as ImageIcon, Music2, Video, X } from "lucide-react";
+import { FileText, Group, Image as ImageIcon, Music2, Video, WandSparkles, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import i18n from "@/i18n";
@@ -10,6 +10,8 @@ import { useThemeStore } from "@/stores/use-theme-store";
 import type { NodeGenerationInput } from "./canvas-node-generation";
 import { CanvasNodeReferenceBar } from "./canvas-node-reference-bar";
 import type { CanvasNodeData } from "@/types/canvas";
+import { usePromptOptimizer } from "@/hooks/use-prompt-optimizer";
+import type { PromptOptimizationInput } from "@/lib/prompt-optimization";
 
 type CanvasConfigComposerProps = {
     nodeId: string;
@@ -21,6 +23,8 @@ type CanvasConfigComposerProps = {
     onClose: () => void;
     onDisconnectReference?: (fromNodeId: string, toNodeId: string) => void;
     onStartReferenceSelection?: (nodeId: string) => void;
+    getOptimizationInput?: (prompt: string) => PromptOptimizationInput | null;
+    isRunning?: boolean;
 };
 
 type Token =
@@ -33,7 +37,7 @@ type MentionState = {
 
 export const CONFIG_REFERENCE_PATTERN = /@\[node:([^\]]+)\]/g;
 
-export function CanvasConfigComposer({ nodeId, nodes, value, inputs, connectedNodes = [], onChange, onClose, onDisconnectReference, onStartReferenceSelection }: CanvasConfigComposerProps) {
+export function CanvasConfigComposer({ nodeId, nodes, value, inputs, connectedNodes = [], onChange, onClose, onDisconnectReference, onStartReferenceSelection, getOptimizationInput, isRunning = false }: CanvasConfigComposerProps) {
     const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const editorRef = useRef<HTMLDivElement>(null);
@@ -41,6 +45,7 @@ export function CanvasConfigComposer({ nodeId, nodes, value, inputs, connectedNo
     const [mention, setMention] = useState<MentionState | null>(null);
     const [activeIndex, setActiveIndex] = useState(0);
     const [imagePreview, setImagePreview] = useState<string | null>(null);
+    const { openOptimizer, optimizerDialog } = usePromptOptimizer({ getInput: () => getOptimizationInput?.(value) || null, onApply: onChange, disabled: isRunning });
     const tokens = useMemo(() => parseComposerTokens(value), [value]);
     const referenceById = useMemo(() => new Map(inputs.map((input) => [input.nodeId, input])), [inputs]);
     const candidates = useMemo(() => {
@@ -128,7 +133,10 @@ export function CanvasConfigComposer({ nodeId, nodes, value, inputs, connectedNo
                     <div className="shrink-0 text-xs font-semibold">{t("canvas.composer.title")}</div>
                     <div className="truncate text-[11px] opacity-55">{t("canvas.composer.description")}</div>
                 </div>
-                <Button size="small" type="text" className="!h-7 !w-7 !min-w-7 !p-0" icon={<X className="size-3.5" />} onClick={onClose} />
+                <div className="flex shrink-0 items-center gap-1">
+                    {getOptimizationInput ? <Button size="small" type="text" className="!bg-transparent" style={{ color: theme.node.text }} icon={<WandSparkles className="size-3.5" />} disabled={isRunning} onClick={openOptimizer}>{t("promptOptimization.title")}</Button> : null}
+                    <Button size="small" type="text" className="!h-7 !w-7 !min-w-7 !p-0" icon={<X className="size-3.5" />} onClick={onClose} />
+                </div>
             </div>
             <CanvasNodeReferenceBar nodeId={nodeId} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={onStartReferenceSelection} />
             <div className="relative rounded-xl">
@@ -185,6 +193,7 @@ export function CanvasConfigComposer({ nodeId, nodes, value, inputs, connectedNo
                 {mention && candidates.length ? <MentionMenu inputs={candidates} allInputs={inputs} activeIndex={Math.min(activeIndex, candidates.length - 1)} theme={theme} onSelect={insertReference} /> : null}
             </div>
             {imagePreview ? <Image src={imagePreview} alt={t("canvas.composer.imagePreview")} style={{ display: "none" }} preview={{ visible: true, src: imagePreview, onVisibleChange: (visible) => !visible && setImagePreview(null) }} /> : null}
+            {optimizerDialog}
         </div>
     );
 

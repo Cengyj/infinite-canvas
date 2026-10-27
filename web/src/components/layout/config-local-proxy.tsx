@@ -45,10 +45,9 @@ export function ConfigLocalProxy() {
                         <div className="mt-3 rounded-md bg-stone-100 px-3 py-2 dark:bg-stone-900">
                             <div className="mb-1 text-xs text-stone-500">{t("config.proxy.startHint")}</div>
                             <div className="flex items-center justify-between gap-3">
-                                <code className="min-w-0 flex-1 break-all text-xs">{command}</code>
-                                <Button className="shrink-0" size="small" type="text" icon={<Copy className="size-3.5" />} onClick={() => copyText(command)} />
+                                <code className="min-w-0 truncate text-xs">{command}</code>
+                                <Button size="small" type="text" icon={<Copy className="size-3.5" />} onClick={() => copyText(command)} />
                             </div>
-                            <div className="mt-2 text-xs text-stone-500">{t("config.proxy.originHint")}</div>
                         </div>
                         <Form.Item label={t("config.proxy.address")} extra={t("config.proxy.addressDescription")} className="mt-3 mb-0">
                             <Input
@@ -69,15 +68,13 @@ export function ConfigLocalProxy() {
     );
 }
 
-export function localProxyCommand(proxyUrl: string) {
+function localProxyCommand(proxyUrl: string) {
     // Pinned to @latest because npx otherwise reuses whatever version it already cached.
-    // The proxy accepts valid HTTP(S) page origins by default; avoid baking the
-    // current page into the command so switching between trusted hosted pages
-    // does not require restarting the proxy with a different allow-list.
-    const options: string[] = [];
+    const command = `npx ${LOCAL_PROXY_PACKAGE}@latest`;
     try {
         const port = new URL(normalizeLocalProxyUrl(proxyUrl) || DEFAULT_LOCAL_PROXY_URL).port;
-        if (port && port !== new URL(DEFAULT_LOCAL_PROXY_URL).port) options.push(`--port ${port}`);
-    } catch {}
-    return [`npx ${LOCAL_PROXY_PACKAGE}@latest`, ...options].join(" ");
+        return port && port !== new URL(DEFAULT_LOCAL_PROXY_URL).port ? `${command} --port ${port}` : command;
+    } catch {
+        return command;
+    }
 }

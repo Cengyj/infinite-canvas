@@ -3,7 +3,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
-import { isLocalForageStorageReadReliable, localForageStorage } from "@/lib/localforage-storage";
+import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
@@ -28,7 +28,6 @@ export type CanvasDeletedProject = {
 
 type CanvasStore = {
     hydrated: boolean;
-    storageReady: boolean;
     projects: CanvasProject[];
     deletedProjects: CanvasDeletedProject[];
     createProject: (title?: string) => string;
@@ -45,42 +44,32 @@ const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
-let storageReadReliable = false;
 
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
-        storageReadReliable = false;
         const value = await localForageStorage.getItem(name);
-        if (!value) {
-            storageReadReliable = isLocalForageStorageReadReliable(name);
-            return null;
-        }
+        if (!value) return null;
         const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
-        if (!parsed?.state || !Array.isArray(parsed.state.projects)) throw new Error("Invalid canvas storage");
         queuedPersistState = parsed.state as PersistedCanvasState;
-        storageReadReliable = isLocalForageStorageReadReliable(name);
         return parsed;
     },
     setItem: (name, value) => {
-        if (!storageReadReliable) return;
         const nextState = value.state as PersistedCanvasState;
         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
         queuedPersistState = nextState;
         if (saveTimer) clearTimeout(saveTimer);
         saveTimer = setTimeout(() => {
             saveTimer = null;
-            if (!storageReadReliable) return;
             void localForageStorage.setItem(name, JSON.stringify(value));
         }, 400);
     },
-    removeItem: (name) => storageReadReliable ? localForageStorage.removeItem(name) : undefined,
+    removeItem: (name) => localForageStorage.removeItem(name),
 };
 
 export const useCanvasStore = create<CanvasStore>()(
     persist(
         (set, get) => ({
             hydrated: false,
-            storageReady: false,
             projects: [],
             deletedProjects: [],
             createProject: (title = i18n.t("canvas.project.untitled")) => {
@@ -149,8 +138,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     projects: state.projects,
                     deletedProjects: state.deletedProjects,
                 }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => (_state, error) => {
-                useCanvasStore.setState({ hydrated: true, storageReady: !error && storageReadReliable });
+            onRehydrateStorage: () => () => {
+                useCanvasStore.setState({ hydrated: true });
             },
         },
     ),

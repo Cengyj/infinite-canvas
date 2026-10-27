@@ -17,6 +17,7 @@
 
 - [Local Development](/docs/development/local-development)
 - [Canvas Data Structure](/docs/development/canvas-data-structure)
+- [Prompt Optimization Design](/docs/development/prompt-optimization)
 - [How the Local Codex Connection Works](/docs/development/local-codex-canvas)
 
 ## Business
@@ -31,8 +32,6 @@
 
 ## Project Progress
 
-- [Current Change Review (local source audit)](current-change-review.md)
-- [Custom Merge Review](custom-merge-review.md)
 - [Changelog](/docs/progress/changelog)
 - [Pending Tests](/docs/progress/pending-test)
 - [TODO](/docs/progress/todo)

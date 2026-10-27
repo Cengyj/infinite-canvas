@@ -4,16 +4,12 @@ import { App, Button, Card, Drawer, Empty, Form, Image, Input, Modal, Pagination
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
-import i18n from "@/i18n";
 import { useCopyText } from "@/hooks/use-copy-text";
-import { useMediaReferences } from "@/hooks/use-media-references";
 import { formatBytes, readFileAsDataUrl } from "@/lib/image-utils";
-import { isBrowserNetworkError, isOriginNotAllowedFetchResponse, networkFailureMessage } from "@/lib/network-errors";
 import { getMediaBlob } from "@/services/file-storage";
-import { deleteStoredImages, getImageBlob, getImagePreviewRevision, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
+import { getImageBlob, getImagePreviewRevision, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { cn } from "@/lib/utils";
 import { assetCoverUrl, useAssetStore, type Asset, type AssetKind, type ImageAsset } from "@/stores/use-asset-store";
-import { withLocalProxy } from "@/stores/use-config-store";
 import { exportAssets, readAssetPackage } from "./asset-transfer";
 
 type AssetFormValues = {
@@ -38,11 +34,6 @@ export default function AssetsPage() {
     const coverInputRef = useRef<HTMLInputElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
     const assetInputRef = useRef<HTMLInputElement>(null);
-    const imageDraftRef = useRef<ImageDraft>(null);
-    const draftEpochRef = useRef(0);
-    const coverReadIdRef = useRef(0);
-    const imageUploadRef = useRef<AbortController | null>(null);
-    const ownedImageDraftKeyRef = useRef("");
     const assets = useAssetStore((state) => state.assets);
     const addAsset = useAssetStore((state) => state.addAsset);
     const updateAsset = useAssetStore((state) => state.updateAsset);
@@ -57,8 +48,6 @@ export default function AssetsPage() {
     const [deletingAsset, setDeletingAsset] = useState<Asset | null>(null);
     const [formKind, setFormKind] = useState<AssetKind>("text");
     const [imageDraft, setImageDraft] = useState<ImageDraft>(null);
-    const [uploadingImage, setUploadingImage] = useState(false);
-    useMediaReferences(() => ({ imageDraft: imageDraftRef.current, previewAsset }));
     const coverUrl = Form.useWatch("coverUrl", form) || "";
     const title = Form.useWatch("title", form) || "";
     const tags = Form.useWatch("tags", form) || [];
@@ -84,44 +73,18 @@ export default function AssetsPage() {
         setPage((value) => Math.min(value, maxPage));
     }, [filteredAssets.length, pageSize]);
 
-    useEffect(() => () => {
-        draftEpochRef.current += 1;
-        imageUploadRef.current?.abort();
-        const storageKey = ownedImageDraftKeyRef.current;
-        ownedImageDraftKeyRef.current = "";
-        imageDraftRef.current = null;
-        if (storageKey) void deleteStoredImages([storageKey], true).catch(() => undefined);
-    }, []);
-
-    const updateImageDraft = (draft: ImageDraft) => {
-        imageDraftRef.current = draft;
-        setImageDraft(draft);
-    };
-
-    const disposeImageDraft = (removeFile = true) => {
-        draftEpochRef.current += 1;
-        imageUploadRef.current?.abort();
-        imageUploadRef.current = null;
-        setUploadingImage(false);
-        const storageKey = ownedImageDraftKeyRef.current;
-        ownedImageDraftKeyRef.current = "";
-        updateImageDraft(null);
-        if (removeFile && storageKey) void deleteStoredImages([storageKey], true).catch(() => undefined);
-    };
-
     const openCreate = () => {
-        disposeImageDraft();
         setEditingAsset(null);
+        setImageDraft(null);
         setFormKind("text");
         form.setFieldsValue({ kind: "text", title: "", coverUrl: "", tags: [], source: t("assets.manual"), note: "", content: "" });
         setIsAssetOpen(true);
     };
 
     const openEdit = (asset: Asset) => {
-        disposeImageDraft();
         setEditingAsset(asset);
         setFormKind(asset.kind);
-        updateImageDraft(asset.kind === "image" ? asset.data : null);
+        setImageDraft(asset.kind === "image" ? asset.data : null);
         form.setFieldsValue({
             kind: asset.kind,
             title: asset.title,
@@ -135,14 +98,10 @@ export default function AssetsPage() {
     };
 
     const saveAsset = async () => {
-        if (imageUploadRef.current) return;
-        const epoch = draftEpochRef.current;
         const values = await form.validateFields();
-        if (epoch !== draftEpochRef.current || imageUploadRef.current) return;
-        const savedCoverUrl = values.coverUrl?.trim() || (values.kind === "image" && imageDraft ? imageDraft.dataUrl : "");
         const base = {
             title: values.title.trim(),
-            coverUrl: values.kind === "text" && savedCoverUrl.startsWith("blob:") ? "" : savedCoverUrl,
+            coverUrl: values.coverUrl?.trim() || (values.kind === "image" && imageDraft ? imageDraft.dataUrl : ""),
             tags: values.tags || [],
             source: values.source?.trim(),
             note: values.note?.trim(),
@@ -161,53 +120,23 @@ export default function AssetsPage() {
             editingAsset ? updateAsset(editingAsset.id, asset) : addAsset(asset);
         }
 
-        disposeImageDraft(values.kind !== "image");
         message.success(editingAsset ? t("assets.updated") : t("assets.saved"));
         setIsAssetOpen(false);
     };
 
     const readCoverFile = async (file?: File) => {
         if (!file) return;
-        const epoch = draftEpochRef.current;
-        const readId = ++coverReadIdRef.current;
-        try {
-            const dataUrl = await readFileAsDataUrl(file);
-            if (epoch === draftEpochRef.current && readId === coverReadIdRef.current) form.setFieldValue("coverUrl", dataUrl);
-        } catch (error) {
-            if (epoch === draftEpochRef.current && readId === coverReadIdRef.current) message.error(error instanceof Error ? error.message : t("common.imageReadFailed"));
-        }
+        const dataUrl = await readFileAsDataUrl(file);
+        form.setFieldValue("coverUrl", dataUrl);
     };
 
     const readImageFile = async (file?: File) => {
         if (!file || !file.type.startsWith("image/")) return;
-        imageUploadRef.current?.abort();
-        const controller = new AbortController();
-        imageUploadRef.current = controller;
-        const epoch = draftEpochRef.current;
-        setUploadingImage(true);
-        try {
-            const image = await uploadImage(file, { signal: controller.signal });
-            if (controller.signal.aborted || draftEpochRef.current !== epoch) {
-                await deleteStoredImages([image.storageKey], true).catch(() => undefined);
-                return;
-            }
-            const previousDraft = imageDraftRef.current;
-            const previousKey = ownedImageDraftKeyRef.current;
-            const draft = { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType };
-            ownedImageDraftKeyRef.current = image.storageKey;
-            updateImageDraft(draft);
-            const currentCover = form.getFieldValue("coverUrl");
-            if (!currentCover || currentCover === previousDraft?.dataUrl) form.setFieldValue("coverUrl", draft.dataUrl);
-            if (!form.getFieldValue("title")) form.setFieldValue("title", file.name);
-            if (previousKey) void deleteStoredImages([previousKey], true).catch(() => undefined);
-        } catch (error) {
-            if (!controller.signal.aborted && draftEpochRef.current === epoch) message.error(error instanceof Error ? error.message : t("common.imageReadFailed"));
-        } finally {
-            if (imageUploadRef.current === controller) {
-                imageUploadRef.current = null;
-                setUploadingImage(false);
-            }
-        }
+        const image = await uploadImage(file);
+        const draft = { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType };
+        setImageDraft(draft);
+        if (!form.getFieldValue("coverUrl")) form.setFieldValue("coverUrl", draft.dataUrl);
+        if (!form.getFieldValue("title")) form.setFieldValue("title", file.name);
     };
 
     const copyAssetText = async (asset: Asset) => {
@@ -225,8 +154,8 @@ export default function AssetsPage() {
             }
             const ext = asset.data.mimeType?.split("/")[1]?.split("+")[0] || (asset.kind === "video" ? "mp4" : "png");
             saveAs(blob, `${asset.title || "asset"}.${ext}`);
-        } catch (error) {
-            message.error(error instanceof Error ? error.message : t("assets.downloadFailed"));
+        } catch {
+            message.error(t("assets.downloadFailed"));
         }
     };
 
@@ -241,19 +170,15 @@ export default function AssetsPage() {
     const importAssetZip = async (file?: File) => {
         if (!file) return;
         try {
-            const imported = await readAssetPackage(file);
-            try {
-                imported.assets.forEach((asset) => {
-                    const payload = { ...asset } as Record<string, unknown>;
-                    delete payload.id;
-                    delete payload.createdAt;
-                    delete payload.updatedAt;
-                    addAsset(payload as Parameters<typeof addAsset>[0]);
-                });
-                message.success(t("assets.imported", { count: imported.assets.length }));
-            } finally {
-                imported.release();
-            }
+            const importedAssets = await readAssetPackage(file);
+            importedAssets.forEach((asset) => {
+                const payload = { ...asset } as Record<string, unknown>;
+                delete payload.id;
+                delete payload.createdAt;
+                delete payload.updatedAt;
+                addAsset(payload as Parameters<typeof addAsset>[0]);
+            });
+            message.success(t("assets.imported", { count: importedAssets.length }));
         } catch {
             message.error(t("assets.importFailed"));
         } finally {
@@ -368,7 +293,7 @@ export default function AssetsPage() {
                 </div>
             </main>
 
-            <Modal title={editingAsset ? t("assets.edit") : t("assets.add")} open={isAssetOpen} width={980} onCancel={() => { disposeImageDraft(); setIsAssetOpen(false); }} onOk={() => void saveAsset()} okButtonProps={{ disabled: uploadingImage }} okText={t("common.save")} cancelText={t("common.cancel")} destroyOnHidden>
+            <Modal title={editingAsset ? t("assets.edit") : t("assets.add")} open={isAssetOpen} width={980} onCancel={() => setIsAssetOpen(false)} onOk={() => void saveAsset()} okText={t("common.save")} cancelText={t("common.cancel")} destroyOnHidden>
                 <div className="grid gap-6 pt-1 lg:grid-cols-[minmax(0,1fr)_320px]">
                     <Form form={form} layout="vertical" requiredMark={false} initialValues={{ kind: "text", tags: [] }}>
                         <Form.Item name="kind" label={t("assets.type")}>
@@ -409,7 +334,7 @@ export default function AssetsPage() {
                         ) : (
                             <Form.Item label={t("assets.fields.imageContent")} required>
                                 <div className="rounded-lg border border-dashed border-stone-300 p-4 dark:border-stone-700">
-                                    <Button loading={uploadingImage} icon={<Upload className="size-4" />} onClick={() => imageInputRef.current?.click()}>
+                                    <Button icon={<Upload className="size-4" />} onClick={() => imageInputRef.current?.click()}>
                                         {t("assets.selectImageFile")}
                                     </Button>
                                     {imageDraft ? (
@@ -587,7 +512,7 @@ function AssetDrawer({ asset, onClose, onCopy, onDownload }: { asset: Asset | nu
                         {asset.kind === "text" ? (
                             <Typography.Paragraph className="mt-2 whitespace-pre-wrap">{asset.data.content}</Typography.Paragraph>
                         ) : asset.kind === "video" ? (
-                            <video src={asset.data.url} controls className="mx-auto mt-2 max-h-[70vh] w-full max-w-full rounded-lg bg-black object-contain" style={{ aspectRatio: asset.data.width && asset.data.height ? `${asset.data.width} / ${asset.data.height}` : (asset.data.aspectRatio || "16:9").replace(":", " / ") }} />
+                            <video src={asset.data.url} controls className="mt-2 aspect-video w-full rounded-lg bg-black" />
                         ) : (
                             <Typography.Text className="mt-2 block">
                                 {asset.data.width}x{asset.data.height} · {formatBytes(asset.data.bytes)} · {asset.data.mimeType}
@@ -626,23 +551,7 @@ async function readAssetMediaBlob(asset: Extract<Asset, { kind: "image" | "video
     }
     const url = asset.kind === "video" ? asset.data.url : asset.data.dataUrl || asset.coverUrl;
     if (!url) return null;
-    const requestUrl = withLocalProxy(url);
-    let response: Response;
-    try {
-        response = await fetch(requestUrl);
-    } catch (error) {
-        if (isBrowserNetworkError(error)) {
-            throw new Error(
-                networkFailureMessage(error, requestUrl, {
-                    cors: i18n.t("apiErrors.corsRequired"),
-                    proxy: i18n.t("config.proxy.unreachable"),
-                    fallback: i18n.t("apiErrors.requestFailed"),
-                }),
-            );
-        }
-        throw error;
-    }
-    if (!response.ok && (await isOriginNotAllowedFetchResponse(response, requestUrl))) throw new Error(i18n.t("config.proxy.originNotAllowed"));
+    const response = await fetch(url);
     return response.ok ? response.blob() : null;
 }
 

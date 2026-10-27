@@ -1,0 +1,122 @@
+---
+title: Prompt Optimization Design
+description: Editor integration, reference context, and apply rules for v0.20
+---
+
+# Prompt Optimization Design
+
+Prompt optimization shares one workflow across the image workbench, video workbench, canvas image/video nodes, and their generation-config composer. Users select a text model, edit the source and additional requirements, inspect streamed output, and explicitly apply the result. Applying replaces the prompt without starting image or video generation.
+
+Workbench prompt actions follow the earlier workbench layout: a small prompt label followed by three equal-width, equal-height outlined buttons, ordered Prompt library, View assets, Optimize prompt. The three-column grid uses compact 12px labels and narrow gaps to fit the 420px desktop column. Below 390px, icons disappear while labels remain visible.
+
+Canvas image/video nodes follow the earlier entry layout: a 32px wand icon button sits in the regular prompt panel's bottom toolbar after Prompt library and before model selection, without a separate row. The expanded editor has an icon and text action on the right of its title, opening optimization after the editor's closing animation finishes. Both entries permit empty drafts; config composers keep their existing entry.
+
+Source review confirms that image/video optimization and model presets already exist in the pre-rollback backup, with matching entry points and presets. This work fixes existing gaps in context, image numbering, editor interaction, and configuration persistence within the same optimization flow.
+
+## Official sources and model boundaries
+
+The fetched [GPT-6.1 Sol model page](https://developers.openai.com/api/docs/models/gpt-6.1-sol) confirms that the exact model `gpt-6.1-sol` accepts text and images and outputs text. The [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning) includes Responses API examples for this model and documents `low`, `medium` (default), `high`, `xhigh`, and `max`; `none` and `minimal` are unsupported. The [Responses request reference](https://developers.openai.com/api/reference/resources/responses/methods/create) does not list `auto` for `reasoning.effort`. The interface's automatic setting means omitting effort so the model uses its default; explicit settings send their corresponding value. `auto` in `reasoning.context` or `reasoning.summary` is a different setting.
+
+The [image-input guide](https://developers.openai.com/api/docs/guides/images-vision) and request reference specify `input_text` and `input_image` content blocks for Responses. An image's `image_url` is a fully qualified URL or base64 data URL; `file_id` is also supported. Internal application message blocks must be converted at the request layer rather than sent unchanged to Responses.
+
+The model page links to the [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra#gpt-61-sol). Its Prompting best practices section offers a starting point for evaluation across the family, explicitly based on Astra observations that require evaluation with the chosen model and workload. This design uses clear output formatting, explicit instruction priority, and less stock phrasing without claiming demonstrated Sol quality. Official capability documentation does not establish availability or compatibility for the configured provider, proxy, or account; rewrite quality still needs manual acceptance.
+
+
+## Layers and data flow
+
+Paths below are relative to `web/src/`.
+
+| File | Responsibility |
+| --- | --- |
+| `lib/prompt-optimization.ts` | Input types, generation context, snapshot comparison, and token order |
+| `lib/image-generation-size.ts` | Request-size parsing extracted unchanged from the image API; Gemini generation and optimization share effective ratio/resolution rules |
+| `lib/media-size.ts` | Image/video aspect-ratio and size helpers; optimization context follows the generic video request calculations |
+| `lib/canvas/canvas-resource-references.ts` | Regular-node @ resources and image labels using actual generation input order |
+| `lib/canvas/canvas-prompt-optimization.ts` | Adapts nodes, connections, groups, and regeneration behavior |
+| `hooks/use-prompt-optimizer.tsx` | Opens editor sessions, detects source changes, rechecks before applying, and writes back |
+| `components/prompt-optimize-dialog.tsx` | Source/result editing, model selection, streaming preview, stopping, copying, and continued optimization |
+| `services/api/prompt-optimization.ts` | Builds instructions and read-only context, loads optional reference images, and validates output |
+| `services/api/image.ts` | Reuses OpenAI, Gemini, and custom text scripts with complete-result checks for optimization |
+
+Each entry provides `getInput` and `onApply`. Opening captures the current input; edits inside the dialog affect only the optimization request. Applying reads and compares the current input again before calling the editor's existing update action. Shared providers and the text model come directly from the existing configuration store.
+
+An empty source is allowed when opening the dialog, and opening sends no request. Users can enter their initial draft inside it; a nonempty source is required only before starting an optimization request. Canceling still leaves the original editor unchanged.
+
+Sessions and results live only in component memory. Closing does not create separate history or a new persistent schema. Applied prompts follow the existing workbench/canvas persistence behavior. API keys remain in browser storage, and requests use the existing direct route or explicitly enabled local proxy. Built-in OpenAI text requests send `store: false`; custom scripts control their own requests.
+
+## Context and references
+
+- **Separate draft and upstream text:** the editable draft is `prompt`, while connected text becomes read-only `upstreamText`. Instructions tell the model to use this context without copying it into the result, avoiding repeated `【Text N】` blocks during generation.
+- **Generation and optimization models are separate:** `generationModel` describes the target image/video model and its OpenAI, Gemini, or script transport; `textModel` performs the rewrite. Optimization does not switch the generation model or mechanically insert model names and parameters into the prompt.
+- **Generation system instructions:** image context includes the configured `systemPrompt` as read-only `generationSystemPrompt`. Optimization accounts for these constraints without copying them into the draft or treating them as instructions to override its output contract. Snapshot comparison includes the field, so changes invalidate old results.
+- **Gemini image size:** built-in requests and optimization share `resolveGeminiImageConfig`. Context uses effective `aspectRatio` and `imageSize` as `frameSize` and `resolution` instead of claiming that raw pixels or an input ratio are the final request parameters. Parsing and limits were extracted unchanged; incomplete edits omit unresolved fields while generation retains its existing validation. Saved scripts keep their own input contract.
+- **Effective video settings:** optimization context follows generic request rules for mode, duration, size, and resolution. More than two images in frames mode use general references, and `videoSeconds=-1` clamps to 4 seconds. Custom scripts use generic input descriptions without inferring their internal behavior. Image size and quality remain independent. Built-in Gemini video uses only the first reference video and first reference audio, and context names reflect that scope.
+- **Image intent and roles:** `imageIntent` distinguishes `create`, `reference`, and `edit`. Source-image editing context requires the source image to be present in the actual reference list; an existing image node or ordinary references alone do not imply editing. `imageRoles` follows actual order with `source-image`, `reference-image`, `first-frame`, or `last-frame` and remains in internal context and snapshot comparison. Requests include roles only in `referenceImages[].role` and labels preceding actual images, without repeating them inside `generationContext`. These technical roles do not invent artistic purposes such as style or composition.
+- **Regular nodes:** the `@` menu, Image N labels, and optimization references follow the actual generation order. Creating a new result prepends the source only when it has image content. Overwrite does not add it automatically, but a source explicitly referenced through a group or connection keeps its actual position. Numbering reuses generation input parsing, including group expansion, deduplication, and connected-config priority, without rewriting existing draft text.
+- **Config nodes:** a nonempty composer selects inputs through `@[node:id]` tokens. Group tokens expand valid children and deduplicate node IDs. Without composer content, implicit inputs become an explicit token draft only in the optimization snapshot until the user applies it.
+- **Stable tokens:** results preserve every distinct token and its first-appearance order. Repetition is allowed, but changing IDs, removing/adding tokens, reordering first appearances, or substituting labels is rejected. The dialog displays readable chips; selected-text copy/cut writes original `@[node:...]` tokens to the clipboard. Cutting a read-only result does not delete it.
+- **Image analysis is off by default:** disabled analysis sends labels, names, and roles without inferring visual contents from filenames. Enabling it loads original images in actual order and sends them with labels and roles. Video/audio references provide names only; their media is not supplied for analysis.
+- **Local generation identity:** `generationIdentity` is used only for snapshot comparison. It includes model, provider, protocol, URL, script, and the original image `config.size`, and is never sent to the optimizer. Raw-size changes invalidate old output even for auto/incomplete states or identical resolved ratio/resolution, without sending an invalid size as a generation condition.
+
+## Rewrite contract and text requests
+
+The service applies a shared contract followed by image or video rules. The shared contract preserves language, subject identity and count, explicit exclusions, and visible wording including quotation marks, punctuation, and requested line breaks. New additional requirements are incorporated, overriding original creative details only where they explicitly conflict and never overriding the token contract. Source material and upstream content are creative data rather than instructions to change the output contract. Image rules distinguish creation, reference-guided creation, and source editing, stating what changes and what stays. Video rules distinguish frame anchors from general references, maintain identity and continuity, fit achievable actions to short clips, and follow explicit sound requests and the effective audio switch.
+
+The model is instructed to return only a usable prompt body without explanation, headings, JSON, code fences, or extra enclosing quotation marks. Code trims surrounding whitespace without heuristically stripping quotation marks or fences, which could damage requested visible text; output-format compliance is part of manual acceptance. Parameters constrain composition, pacing, and output conditions without mechanically filling photography categories or guessing roles from filenames and unanalyzed media.
+
+Newly loaded OpenAI/Gemini default text-script templates correct image/text conversion, request paths, complete-result validation, and refusal handling. They do not automatically overwrite saved user scripts. Saved scripts remain user-controlled and must not be assumed to inherit template fixes. Native Gemini text requests filter content marked `thought`, passing only answer text to optimization.
+
+## Applying, invalidation, and cancellation
+
+Only complete, nonempty output with valid tokens can be applied. Built-in OpenAI/Gemini requests require a valid completion state. Truncated, refused, failed, or interrupted responses cannot become applicable output. Custom text scripts must finish normally and return text.
+
+A session belongs to the current workbench session or canvas project/node. Changes to the source, reference order/content, upstream text, generation system instructions, raw image size or effective ratio/resolution, reference mapping, or generation context invalidate its snapshot; users can reload the current input. The dialog checks the actual resolved text provider and rechecks the latest model and source snapshot when a delayed response completes, rather than comparing only the global default provider. Unavailable models require configuration instead of silently selecting another provider.
+
+After additional requirements change, the previous complete result cannot be applied directly but can still serve as the base for continued optimization with the new requirements. Failure or cancellation preserves that complete draft for inspection and revision without making it applicable to the new requirements. Changing the source, analysis switch, or text-model configuration also requires another optimization.
+
+Stopping, closing, unmounting the editor, invalidating the source, or changing text-model configuration cancels the request. Late chunks cannot update the preview. Stopping or failing preserves the previous complete result rather than applying partial output. Regular nodes reuse `updatePrompt` to update local editor state and metadata together; config nodes receive the raw token draft. No additional binding affects later generation after application.
+
+Keyboard events inside the optimization dialog are isolated from canvas shortcuts, preventing text editing from also deleting, undoing, or selecting canvas nodes. Escape retains normal dialog behavior. Copy/cut serializes selected raw tokens; paste accepts plain text, and application still requires complete-result and reference validation.
+
+## Manual acceptance cases
+
+These 21 cases are illustrative inputs and judgment criteria, not model outputs or evidence of real-model validation. Inspect the rewritten text first, then verify images or sound through generation acceptance arranged by the user. Interface and failure paths can use simulated responses; passing those does not establish real-model quality.
+
+
+| Input conditions (illustrative) | Must preserve | Acceptance criteria |
+| --- | --- | --- |
+| 1. Chinese packaging: request a product image with two front-label lines, `“早安·麦香”` and `净含量：250 g`. | Chinese wording, quotation marks, middle dot, colon, spacing, quantity, and two-line layout. | Both lines remain exact; no translation or invented brand, and quote stripping does not damage the wording. |
+| 2. Background only: a red cup source image with “Change only the background to light blue; keep the cup.” | Product identity, count, color, shape, and all unrequested attributes. | Only an actually supplied source receives `source-image` / `edit`; the rewrite changes the background without redesigning the cup. |
+| 3. Transparency: no references; request one ragdoll-cat sticker with transparent background enabled. | One cat, sticker intent, and transparency. | No floor, landscape, solid backdrop, or checkerboard is added; transparency is not depicted as a grid. |
+| 4. Multiple images: image 1 controls product shape and image 2 only the palette; try analysis off and on. | Numbering, order, assigned purposes, and unspecified purposes remaining unspecified. | With analysis off, do not claim visual inspection; with it on, use only relevant observations without turning image 2 into an unsolicited composition or source reference. |
+| 5. Single video first frame: frames mode with one image; a character slowly turns left. | Initial subject, identity, count, and direction. | The role is first-frame; no invented ending or extra character based on a filename. |
+| 6. First and last frames: image 1 shows a closed door and image 2 an open door; request a static camera. | Start/end order, the same door, and the static camera. | Roles are first-frame/last-frame; connect states continuously without swapping frames or adding camera movement. |
+| 7. Multiple video references: select frames with three images assigned to character, clothing, and setting. | Effective reference mode, assigned purposes, and image numbering. | Retain the existing conversion to general references above two images, without treating them as beginning/middle/end frames; Gemini video/audio lists describe only the first item actually used. |
+| 8. Short action: a 4-second clip of one ball rolling to a stop with a static camera. | One ball, rolling then stopping, static camera, and short duration. | No added scene changes or story; the existing `videoSeconds=-1` context is also 4 seconds and must not be described as automatic duration. |
+| 9. Sound: with audio enabled, request “Rain only, no music or voices”; with audio disabled, request “A silent rainy scene with a static camera.” | Each compatible sound or silence requirement, exclusions, camera constraint, and the effective audio switch. | Do not add narration or music when enabled; preserve silence and the static camera without promising audible output when disabled; neither case claims to have analyzed reference audio. |
+| 10. Canvas tokens: use `@[node:group-a]` then `@[node:image-b]`, where the group also contains image-b; also try an empty composer. | Raw IDs, first-appearance order, deduplicated group resources, and implicit inputs. | No label substitution or expansion into source text; an empty composer gains tokens only in the optimization snapshot until application. |
+| 11. Upstream text: connect “The protagonist wears round glasses” to a draft of “Standing beside a window.” | Editable draft and read-only upstreamText remain distinct. | Understand the upstream constraint without copying the whole passage into the draft; generation appends upstream content only once. |
+| 12. Stale snapshot: during optimization change the draft, reference order, target generation script, or the selected text provider's URL/key. | Current project, node, model, and input ownership. | Delayed completion cannot become applicable; reloading reads current context, and generationIdentity is absent from the outgoing request. |
+| 13. Cancel: stop or close during streaming, then simulate late chunks. | Original editor draft and any prior complete result. | Late chunks cannot update the preview or editor; partial output does not become applicable. |
+| 14. Disconnect: deliver partial text without a valid terminal completion. | Complete-result requirement and the prior complete draft. | Partial output cannot be applied; the earlier complete draft remains available during retry. |
+| 15. Failure: simulate refusal, request error, or empty output; include thought content in a Gemini response. | Error state and the answer-text boundary. | Failure does not overwrite a previous complete draft; thought content never reaches the preview or editor, and refusals are not successful answers. |
+| 16. Refine: after a complete result, change requirements to “Keep the subject and reduce decoration.” | Current complete draft as the base, new requirements, and existing hard constraints. | The old result immediately becomes inapplicable, but refinement can send it with the new requirements; failure keeps it visible without making it applicable. |
+| 17. Apply: edit a complete result, keep the source/configuration unchanged, then apply. | Final edited text, current target, and raw tokens. | Replace only the current draft without starting generation; regular-panel state and metadata stay synchronized, while canceling writes nothing. |
+| 18. Generation system instructions: image generation separately requires “Preserve the brand and packaging text”; draft “Product poster”; change that instruction during optimization. | Editable draft and read-only generation constraints remain separate, with generation instructions handled by the existing generation flow. | `generationSystemPrompt` informs optimization without being copied into the result; changing it invalidates old output. Video context does not invent image-generation system instructions. |
+| 19. Gemini image size: use `864x2016`, `1000x2000`, `9:21`, and `auto`, then leave a size edit incomplete. | Configuration stays unchanged and context agrees with the built-in request. | Local rules expect `9:16/1K`, `9:16/2K`, ratio-only `9:16`, and no explicit ratio/resolution, respectively. An incomplete edit does not crash snapshot reads or invent a valid size. A changed raw size invalidates old output even if its mapping is unchanged. These are rule examples, not model outputs. |
+| 20. Regular image numbering: an existing source and one external image, under new-result and overwrite behavior, with duplicate group references or a connected config node. | Actual image participation, group deduplication, config-input priority, and upstream-text order. | New-result labels source as Image 1 and external as Image 2; overwrite does not automatically add source and labels external Image 1. The `@` list matches optimization originals; an explicitly grouped source retains its actual position. |
+| 21. Editor shortcuts and clipboard: select text including a token in source/result, use delete, undo, select-all, copy, cut, paste, then Escape. | Selection, raw token IDs, read-only state, and canvas nodes. | Editing shortcuts do not trigger canvas deletion/undo/selection. Clipboard text preserves raw tokens and pasting keeps IDs; read-only cut does not delete content, and Escape follows normal dialog closing behavior. |
+
+## Validation boundaries
+
+The 21 cases support manual acceptance of image/video optimization in both workbenches, regular and expanded canvas editors, and configuration composers. They describe inputs and criteria, not real-model outputs. Simulated responses can verify interactions and failure paths, but cannot establish rewrite quality.
+
+The complete isolated mock behavior regression passed: 119 tests across 6 files, 0 failures, 431 assertions, and exit code 0. It covers generation system instructions, effective Gemini image parameters and snapshot invalidation, image reference numbering, configuration save/hydration, optimization requests, text streaming, and script templates. This does not establish real-model rewrite quality; browser shortcuts, selected-text copy/cut, and actual interactions still need manual acceptance. No syntax check, type check, build, or real API request was run. See [Pending Tests](/docs/progress/pending-test).
+
+Run from `web/`:
+
+```sh
+bun test tests/model-selection.test.ts tests/canvas-prompt-optimization.test.ts tests/prompt-optimization-context.test.ts tests/prompt-optimization.test.ts tests/text-stream.test.ts tests/text-templates.test.ts
+```
+
+Real-provider acceptance must cover text-model permissions, OpenAI/Gemini or saved scripts, direct/proxy routing, readable reference images and vision support, and preservation of language, subjects, visible text, and video actions.

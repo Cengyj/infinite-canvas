@@ -38,7 +38,7 @@ Connect token: xxxxxx
 
 Codex app 插件会读取启动输出里的 Local URL 和 Connect token，并直接打开画布网页地址；Canvas Agent 不负责生成画布打开 URL。
 
-Canvas Agent 默认只监听 `127.0.0.1`。每个 HTTP(S) 网页带正确 token 连接后，Canvas Agent 都会记录并授权该网页 Origin；更换网页地址无需清空已保存的 `origins`。业务请求仍必须携带正确 token，`file://` 等不透明来源不支持直接连接，请通过 HTTP(S) 打开画布。
+Canvas Agent 默认只监听 `127.0.0.1`。网页第一次带正确 token 连接后，Canvas Agent 会记录该网页 Origin；之后其他 Origin 不能复用这个本地 Agent，除非用户清理 `~/.infinite-canvas/canvas-agent.json` 里的 `origins`。
 
 ## 发布
 

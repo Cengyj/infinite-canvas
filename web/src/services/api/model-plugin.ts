@@ -1,9 +1,7 @@
 import axios, { type AxiosRequestConfig } from "axios";
 
 import i18n from "@/i18n";
-import { VIDEO_POLL_INTERVAL_MS, VIDEO_POLL_TIMEOUT_MS } from "@/lib/video-config";
-import { classifyNetworkFailure, isAbortError, isBrowserNetworkError, isOriginNotAllowedFetchResponse, isOriginNotAllowedResponse, networkFailureMessage } from "@/lib/network-errors";
-import { appendUrlPath, buildApiUrl, isHttpUrl, withLocalProxy, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { buildApiUrl, withLocalProxy, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 
 type RequestOptions = { signal?: AbortSignal };
 
@@ -14,7 +12,7 @@ export type PluginHttpOptions = {
 };
 
 export type PluginHttp = {
-    url: (path: string, apiVersion?: "v1" | "v1beta") => string;
+    url: (path: string) => string;
     post: (path: string, body?: unknown, options?: PluginHttpOptions) => Promise<unknown>;
     get: (path: string, options?: PluginHttpOptions) => Promise<unknown>;
 };
@@ -41,20 +39,9 @@ function pluginHeaders(extra?: Record<string, string>, hasJsonBody = false): Rec
     return { ...headers, ...extra };
 }
 
-function pluginUrl(config: AiConfig, path: string, apiVersion: "v1" | "v1beta" = "v1") {
-    if (isHttpUrl(path)) return withLocalProxy(path);
-    const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-    if (/^\/v1(?:beta)?(?:\/|$)/i.test(normalizedPath)) {
-        const base = new URL(config.baseUrl);
-        base.pathname = base.pathname.replace(/\/+$/, "").replace(/\/v1(?:beta)?$/i, "");
-        return withLocalProxy(appendUrlPath(base.toString(), normalizedPath));
-    }
-    return buildApiUrl(config.baseUrl, normalizedPath, apiVersion);
-}
-
-function pluginRequestUrl(config: AiConfig, path: string) {
-    if (isHttpUrl(path)) return withLocalProxy(path);
-    return withLocalProxy(appendUrlPath(config.baseUrl, path.startsWith("/") ? path : `/${path}`));
+function pluginUrl(config: AiConfig, path: string) {
+    if (/^https?:/i.test(path)) return withLocalProxy(path);
+    return buildApiUrl(config.baseUrl, path.startsWith("/") ? path : `/${path}`);
 }
 
 function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHttp {
@@ -72,7 +59,7 @@ function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHtt
         return response.data;
     };
     return {
-        url: (path, apiVersion) => pluginUrl(config, path, apiVersion),
+        url: (path) => pluginUrl(config, path),
         post: (path, body, opts) => run("post", path, body, opts),
         get: (path, opts) => run("get", path, undefined, opts),
     };
@@ -81,33 +68,8 @@ function createPluginHttp(config: AiConfig, options?: RequestOptions): PluginHtt
 /** Raw request with no automatic auth header — the script controls method, url, headers, body entirely. */
 function createPluginRequest(config: AiConfig, options?: RequestOptions) {
     return async (requestConfig: AxiosRequestConfig & { url: string }) => {
-        const response = await axios.request({ ...requestConfig, url: pluginRequestUrl(config, requestConfig.url), signal: options?.signal });
+        const response = await axios.request({ ...requestConfig, url: pluginUrl(config, requestConfig.url), signal: options?.signal });
         return response.data;
-    };
-}
-
-/** Give custom scripts the same proxy-aware fetch used by the built-in helpers. */
-function createPluginFetch(signal?: AbortSignal) {
-    return (input: RequestInfo | URL, init?: RequestInit) => {
-        const rawUrl = typeof input === "string" || input instanceof URL ? String(input) : input.url;
-        const requestUrl = withLocalProxy(rawUrl);
-        const request = typeof input === "string" || input instanceof URL ? requestUrl : requestUrl !== rawUrl ? new Request(requestUrl, input) : input;
-        const requestSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-        const combinedSignal = signal && requestSignal ? AbortSignal.any([signal, requestSignal]) : signal || requestSignal;
-        return fetch(request, combinedSignal ? { ...init, signal: combinedSignal } : init).then(async (response) => {
-            if (await isOriginNotAllowedFetchResponse(response, requestUrl)) throw new Error(i18n.t("config.proxy.originNotAllowed"));
-            return response;
-        }).catch((error) => {
-            if (isAbortError(error)) throw error;
-            if (isBrowserNetworkError(error)) {
-                throw new Error(networkFailureMessage(error, requestUrl, {
-                    cors: i18n.t("apiErrors.corsRequired"),
-                    proxy: i18n.t("config.proxy.unreachable"),
-                    fallback: i18n.t("apiErrors.requestFailed"),
-                }));
-            }
-            throw error;
-        });
     };
 }
 
@@ -117,16 +79,15 @@ function sleep(ms: number, signal?: AbortSignal) {
             reject(new DOMException("Aborted", "AbortError"));
             return;
         }
-        const onAbort = () => {
-            clearTimeout(timer);
-            reject(new DOMException("Aborted", "AbortError"));
-        };
-        const timer = setTimeout(() => {
-            signal?.removeEventListener("abort", onAbort);
-            resolve();
-        }, ms);
-        signal?.addEventListener("abort", onAbort, { once: true });
-        if (signal?.aborted) onAbort();
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+            "abort",
+            () => {
+                clearTimeout(timer);
+                reject(new DOMException("Aborted", "AbortError"));
+            },
+            { once: true },
+        );
     });
 }
 
@@ -140,7 +101,7 @@ function createPoll(signal?: AbortSignal) {
             const result = extract(await request());
             if (result !== null && result !== undefined && result !== false) return result;
             if (performance.now() >= deadline) throw new Error(i18n.t("modelPlugin.pollTimeout"));
-            await sleep(Math.min(intervalMs, Math.max(0, deadline - performance.now())), signal);
+            await sleep(intervalMs, signal);
         }
     };
 }
@@ -153,7 +114,6 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
     const { config } = args;
     const http = createPluginHttp(config, { signal: args.signal });
     const request = createPluginRequest(config, { signal: args.signal });
-    const pluginFetch = createPluginFetch(args.signal);
     const poll = createPoll(args.signal);
     const runner = new Function(
         "prompt",
@@ -173,7 +133,6 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
         "sleep",
         "signal",
         "onDelta",
-        "fetch",
         `"use strict"; return (async () => {\n${args.script}\n})();`,
     ) as (...fnArgs: unknown[]) => Promise<T>;
     try {
@@ -195,21 +154,10 @@ export async function runModelPlugin<T = unknown>(args: RunPluginArgs): Promise<
             (ms: number) => sleep(ms, args.signal),
             args.signal,
             args.onDelta,
-            pluginFetch,
         );
     } catch (error) {
-        if (isAbortError(error)) throw error;
+        if (error instanceof DOMException && error.name === "AbortError") throw error;
         if (axios.isCancel(error)) throw error;
-        if (axios.isAxiosError(error) && isOriginNotAllowedResponse(error.response, String(error.config?.url || ""))) {
-            throw new Error(i18n.t("config.proxy.originNotAllowed"));
-        }
-        const requestUrl = axios.isAxiosError(error) ? String(error.config?.url || "") : "";
-        if (isBrowserNetworkError(error)) {
-            const kind = classifyNetworkFailure(error, requestUrl);
-            if (kind === "cors") throw new Error(i18n.t("apiErrors.corsRequired"));
-            if (kind === "proxy") throw new Error(i18n.t("config.proxy.unreachable"));
-            if (kind === "network") throw new Error(i18n.t("apiErrors.requestFailed"));
-        }
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(i18n.t("modelPlugin.executionFailed", { message }));
     }
@@ -237,7 +185,6 @@ export function getPluginVariables(): PluginVariable[] {
         { name: "sleep", type: "function", desc: i18n.t("modelPlugin.variables.sleep") },
         { name: "signal", type: "AbortSignal", desc: i18n.t("modelPlugin.variables.signal") },
         { name: "onDelta", type: "function", desc: i18n.t("modelPlugin.variables.onDelta"), capabilities: ["text"] },
-        { name: "fetch", type: "function", desc: i18n.t("modelPlugin.variables.fetch") },
     ];
 }
 
@@ -277,43 +224,6 @@ export function getPluginAuthoringPrompt(capability: ModelCapability, modelName:
 export type PluginTemplate = { label: string; script: string };
 
 export function getPluginTemplates(): Record<ModelCapability, PluginTemplate[]> {
-    const openaiVideoPolling = `
-  const unwrap = (value) => {
-    if (value && value.code !== undefined) {
-      if (![0, "0", 200, "200"].includes(value.code)) throw new Error(value.error?.message || value.message || value.msg || "video request failed");
-      return value.data;
-    }
-    return value;
-  };
-  const created = unwrap(task);
-  const rawId = created?.id ?? created?.task_id ?? created?.request_id ?? created?.data?.id;
-  if (rawId === undefined || rawId === null || !String(rawId).trim()) throw new Error(${JSON.stringify(i18n.t("apiErrors.noVideoTaskId"))});
-  const taskId = encodeURIComponent(String(rawId));
-  return await poll(async () => {
-    const state = unwrap(await request({ method: "get", url: http.url("/videos/" + taskId), headers }));
-    const status = String(state?.status || state?.data?.status || "").trim().toLowerCase();
-    if (["failed", "fail", "error", "cancelled", "canceled"].includes(status)) {
-      const failure = state.error || state.data?.error;
-      throw new Error((typeof failure === "string" ? failure : failure?.message) || state.error_message || state.fail_reason || state.message || ${JSON.stringify(i18n.t("apiErrors.videoGenerationFailed"))});
-    }
-    const output = state.video || state.content || state.output || state.data || state;
-    const url = state.video_url || state.result_url || state.download_url || state.url || output.video_url || output.result_url || output.download_url || output.url;
-    if (url) {
-      const provider = new URL(baseUrl);
-      if (!/\\/v1(?:beta)?\\/?$/i.test(provider.pathname)) provider.pathname = provider.pathname.replace(/\\/+$/, "") + "/v1";
-      provider.pathname = provider.pathname.replace(/\\/+$/, "") + "/";
-      const resolved = new URL(url, provider);
-      if (resolved.origin === provider.origin && /\\/videos\\/[^/]+\\/content\\/?$/i.test(resolved.pathname)) {
-        return await request({ method: "get", url: resolved.toString(), headers, responseType: "blob" });
-      }
-      return { url: resolved.toString(), width: output.width || state.width, height: output.height || state.height, aspectRatio: output.aspect_ratio || state.aspect_ratio };
-    }
-    const progress = Number(String(state.progress ?? state.data?.progress ?? "").replace(/%$/, ""));
-    if (["completed", "complete", "success", "succeeded", "done", "finished"].includes(status) || progress >= 100) {
-      return await request({ method: "get", url: http.url("/videos/" + taskId + "/content"), headers, responseType: "blob" });
-    }
-    return null;
-  }, (result) => result, { intervalMs: ${VIDEO_POLL_INTERVAL_MS}, timeoutMs: ${VIDEO_POLL_TIMEOUT_MS} });`;
     return {
     image: [
         {
@@ -326,11 +236,11 @@ export function getPluginTemplates(): Record<ModelCapability, PluginTemplate[]> 
  * @param {string[]} images - reference images as data URLs; empty for text-to-image
  * @param {object} params
  * @param {string} params.size - output size, e.g. "1024x1024" or "auto"
- * @param {string} params.quality - "low" | "medium" | "high"
+ * @param {string} params.quality - "low" | "medium" | "high" | "xhigh" | "max"
  * @param {number} params.count - number of images
  * @param {string} [params.background] - "transparent" when requested
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {function} request - raw HTTP helper; relative urls join baseUrl without /v1
  * @returns {Promise<string[]>} image URLs or data URLs
@@ -345,17 +255,14 @@ async function generateImage({
     background,
   },
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 }) {
-  count = Math.max(1, Math.min(10, Math.floor(Number(count) || 1)));
-  if (images.length > 16) throw new Error(${JSON.stringify(i18n.t("imageWorkbench.editReferenceLimit", { count: 16 }))});
-  const isGptImage = /gpt-image/i.test(model);
   if (images.length === 0) {
     const data = await request({
       method: "post",
-      url: http.url("/images/generations"),
+      url: \`\${baseUrl}/v1/images/generations\`,
       headers: {
         "Content-Type": "application/json",
         Authorization: \`Bearer \${apiKey}\`,
@@ -364,14 +271,12 @@ async function generateImage({
         model: model,
         prompt: prompt,
         n: count,
-        ...(size ? { size: size } : {}),
-        ...(quality ? { quality: quality } : {}),
-        ...(isGptImage && background ? { background: background } : {}),
-        ...(isGptImage ? { output_format: "png" } : { response_format: "b64_json" }),
+        size: size,
+        quality: quality,
+        background: background,
+        response_format: "b64_json",
       },
     });
-    const apiError = typeof data.error === "string" ? data.error : data.error?.message;
-    if (apiError) throw new Error(apiError);
     const urls = [];
     for (const item of data.data || []) {
       urls.push(item.b64_json ? \`data:image/png;base64,\${item.b64_json}\` : item.url);
@@ -383,28 +288,22 @@ async function generateImage({
   form.set("model", model);
   form.set("prompt", prompt);
   form.set("n", String(count));
-  if (size) form.set("size", size);
-  if (quality) form.set("quality", quality);
-  if (isGptImage && background) form.set("background", background);
-  if (isGptImage) form.set("output_format", "png");
-  else form.set("response_format", "b64_json");
+  form.set("size", size);
+  form.set("quality", quality);
+  form.set("background", background);
+  form.set("response_format", "b64_json");
   const imageField = images.length > 1 ? "image[]" : "image";
   for (const dataUrl of images) {
-    const source = typeof dataUrl === "string" && /^(?:https?:\\/\\/|\\/\\/)/i.test(dataUrl) ? http.url(dataUrl) : dataUrl;
-    const response = await fetch(source, { signal });
-    if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
-    form.append(imageField, await response.blob(), "ref.png");
+    form.append(imageField, await (await fetch(dataUrl)).blob(), "ref.png");
   }
   const edited = await request({
     method: "post",
-    url: http.url("/images/edits"),
+    url: \`\${baseUrl}/v1/images/edits\`,
     headers: {
       Authorization: \`Bearer \${apiKey}\`,
     },
     data: form,
   });
-  const apiError = typeof edited.error === "string" ? edited.error : edited.error?.message;
-  if (apiError) throw new Error(apiError);
   const urls = [];
   for (const item of edited.data || []) {
     urls.push(item.b64_json ? \`data:image/png;base64,\${item.b64_json}\` : item.url);
@@ -417,8 +316,8 @@ return await generateImage({
   images,
   params,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 });`,
         },
@@ -426,33 +325,35 @@ return await generateImage({
             label: i18n.t("modelPlugin.templates.gemini"),
             script: `/**
  * Gemini image generation via models/{model}:generateContent.
- * Reference images go into parts.inlineData. size maps to the closest supported aspectRatio;
- * quality maps to imageSize only for models that support image-size configuration.
+ * Reference images go into parts.inline_data. size maps to aspectRatio, resolution maps to imageSize; Gemini has no quality parameter.
  * @param {string} prompt
  * @param {string[]} images - reference images as data URLs
  * @param {object} params
- * @param {string} params.size - normalized legacy script size, usually pixel dimensions
- * @param {string} [params.requestedSize] - original Gemini size before generic script-size normalization
- * @param {string} params.quality - "low" | "medium" | "high"; sent as imageSize when supported
+ * @param {string} params.size - "2048x2048", "16:9", "auto", etc.; sent as aspectRatio
+ * @param {string} params.resolution - "1k" | "2k" | "4k" | "auto"; sent as imageSize
+ * @param {string} params.quality - "low" | "medium" | "high" | "xhigh" | "max"; unused here
  * @param {number} params.count - number of generateContent calls
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {function} request
  * @returns {Promise<string[]>} image data URLs
  */
+function gcd(a, b) {
+  return b ? gcd(b, a % b) : a;
+}
+
 async function generateImage({
   prompt,
   images,
   params: {
     size,
-    requestedSize,
-    quality,
+    resolution,
     count,
   },
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 }) {
   const parts = [{ text: prompt }];
@@ -460,80 +361,34 @@ async function generateImage({
     const match = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
     if (match) {
       parts.push({
-        inlineData: {
-          mimeType: match[1],
+        inline_data: {
+          mime_type: match[1],
           data: match[2],
         },
       });
     }
   }
 
-  const modelName = String(model || "").trim().replace(/^models\\//, "").replace(/-preview$/i, "").toLowerCase();
-  const modelProfiles = {
-    "gemini-3.1-flash-image": { imageSizes: ["512", "1K", "2K", "4K"], extended: true },
-    "gemini-3.1-flash-lite-image": { imageSizes: ["1K"], extended: true },
-    "gemini-3-pro-image": { imageSizes: ["1K", "2K", "4K"], extended: false },
-    "gemini-2.5-flash-image": { extended: false },
-  };
-  const profile = modelProfiles[modelName] || null;
-  const standardRatios = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"];
-  const ratios = profile && profile.extended ? standardRatios.concat(["1:4", "1:8", "4:1", "8:1"]) : standardRatios;
-  const parseRatio = (value) => {
-    const match = String(value || "").match(/^(\\d+(?:\\.\\d+)?)[x:](\\d+(?:\\.\\d+)?)$/i);
-    if (!match) return null;
-    const width = Number(match[1]);
-    const height = Number(match[2]);
-    return width > 0 && height > 0 ? width / height : null;
-  };
-  const closestAspectRatio = (value) => {
-    const target = parseRatio(value);
-    if (!target) return "1:1";
-    return ratios.reduce((best, current) => Math.abs(parseRatio(current) - target) < Math.abs(parseRatio(best) - target) ? current : best);
-  };
-  const imageSizeMap = {
-    low: "1K",
-    medium: "2K",
-    high: "4K",
-    standard: "1K",
-    hd: "2K",
-  };
-  const presetImageSizeByDimensions = {
-    "1024x1024": "1K", "1024x1536": "1K", "1536x1024": "1K", "1024x768": "1K", "768x1024": "1K", "1536x864": "1K", "864x1536": "1K", "2016x864": "1K", "864x2016": "1K",
-    "2048x2048": "2K", "1360x2048": "2K", "2048x1360": "2K", "2048x1536": "2K", "1536x2048": "2K", "2048x1152": "2K", "1152x2048": "2K", "2688x1152": "2K", "1152x2688": "2K",
-    "2880x2880": "4K", "2336x3520": "4K", "3520x2336": "4K", "3312x2480": "4K", "2480x3312": "4K", "3840x2160": "4K", "2160x3840": "4K", "3840x1648": "4K", "1648x3840": "4K",
-  };
-  const geminiSize = requestedSize || size;
-  const aspectRatio = geminiSize && geminiSize !== "auto" ? closestAspectRatio(geminiSize) : undefined;
-  const dimensions = String(geminiSize || "").match(/^(\\d+)x(\\d+)$/i);
-  const dimensionKey = dimensions ? Number(dimensions[1]) + "x" + Number(dimensions[2]) : String(geminiSize || "").toLowerCase();
-  const requestedImageSize = imageSizeMap[String(quality || "").toLowerCase()]
-    || presetImageSizeByDimensions[dimensionKey]
-    || (dimensions
-      ? (() => {
-          const edge = Math.max(Number(dimensions[1]), Number(dimensions[2]));
-          return edge <= 768 ? "512" : edge <= 1536 ? "1K" : edge <= 3072 ? "2K" : "4K";
-        })()
-      : undefined);
-  const supportedImageSizes = profile && profile.imageSizes;
-  if (requestedImageSize && supportedImageSizes && !supportedImageSizes.includes(requestedImageSize)) {
-    throw new Error("Gemini model " + model + " does not support " + requestedImageSize + "; supported sizes: " + supportedImageSizes.join(", "));
+  let aspectRatio = "1:1";
+  if (size && size !== "auto") {
+    const pixels = size.match(/^(\\d+)x(\\d+)$/);
+    if (pixels) {
+      const width = Number(pixels[1]);
+      const height = Number(pixels[2]);
+      const divisor = gcd(width, height);
+      aspectRatio = \`\${width / divisor}:\${height / divisor}\`;
+    } else if (size.includes(":")) {
+      aspectRatio = size;
+    }
   }
-  const imageSize = requestedImageSize && supportedImageSizes ? requestedImageSize : undefined;
-  const imageConfig = {
-    ...(aspectRatio ? { aspectRatio } : {}),
-    ...(imageSize ? { imageSize } : {}),
-  };
-  const generationConfig = {
-    responseModalities: ["TEXT", "IMAGE"],
-    ...(Object.keys(imageConfig).length ? { imageConfig } : {}),
-  };
+  const imageSize = resolution && resolution !== "auto" ? resolution.toUpperCase() : undefined;
   const n = Number(count) || 1;
   const urls = [];
 
   for (let i = 0; i < n; i++) {
     const data = await request({
       method: "post",
-      url: http.url("/models/" + encodeURIComponent(String(model || "").replace(/^models\\//i, "")) + ":generateContent", "v1beta"),
+      url: \`\${baseUrl}/v1beta/models/\${model}:generateContent\`,
       headers: {
         "Content-Type": "application/json",
         "x-goog-api-key": apiKey,
@@ -545,13 +400,15 @@ async function generateImage({
             parts: parts,
           },
         ],
-        generationConfig: generationConfig,
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          imageConfig: {
+            aspectRatio: aspectRatio,
+            imageSize: imageSize,
+          },
+        },
       },
     });
-    const apiError = typeof data.error === "string" ? data.error : data.error?.message;
-    if (apiError) throw new Error(apiError);
-    const rejected = data.promptFeedback?.blockReason || (data.candidates || []).map((candidate) => candidate.finishReason).find((reason) => reason && reason !== "STOP");
-    if (rejected) throw new Error(${JSON.stringify(i18n.t("apiErrors.geminiRejected", { reason: "__REASON__" }))}.replace("__REASON__", rejected));
     for (const candidate of data.candidates || []) {
       for (const part of candidate.content?.parts || []) {
         const img = part.inlineData || part.inline_data;
@@ -569,8 +426,8 @@ return await generateImage({
   images,
   params,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 });`,
         },
@@ -593,7 +450,7 @@ return await generateImage({
  * @param {boolean} params.generateAudio
  * @param {boolean} params.watermark
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {function} request
  * @param {function} poll
@@ -613,8 +470,8 @@ async function generateVideo({
     watermark,
   },
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
   poll,
 }) {
@@ -629,23 +486,14 @@ async function generateVideo({
   form.set("mode", mode);
   if (mode === "frames") {
     if (images[0]) {
-      const source = typeof images[0] === "string" && /^(?:https?:\\/\\/|\\/\\/)/i.test(images[0]) ? http.url(images[0]) : images[0];
-      const response = await fetch(source, { signal });
-      if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
-      form.append("first_frame", await response.blob(), "first.png");
+      form.append("first_frame", await (await fetch(images[0])).blob(), "first.png");
     }
     if (images[1]) {
-      const source = typeof images[1] === "string" && /^(?:https?:\\/\\/|\\/\\/)/i.test(images[1]) ? http.url(images[1]) : images[1];
-      const response = await fetch(source, { signal });
-      if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
-      form.append("last_frame", await response.blob(), "last.png");
+      form.append("last_frame", await (await fetch(images[1])).blob(), "last.png");
     }
   } else {
     for (const dataUrl of images) {
-      const source = typeof dataUrl === "string" && /^(?:https?:\\/\\/|\\/\\/)/i.test(dataUrl) ? http.url(dataUrl) : dataUrl;
-      const response = await fetch(source, { signal });
-      if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
-      form.append("image[]", await response.blob(), "ref.png");
+      form.append("image[]", await (await fetch(dataUrl)).blob(), "ref.png");
     }
   }
   for (const file of videos) {
@@ -660,12 +508,37 @@ async function generateVideo({
   };
   const task = await request({
     method: "post",
-    url: http.url("/videos"),
+    url: \`\${baseUrl}/v1/videos\`,
     headers,
     data: form,
   });
 
-  ${openaiVideoPolling}
+  return await poll(
+    async () => {
+      const state = await request({
+        method: "get",
+        url: \`\${baseUrl}/v1/videos/\${task.id}\`,
+        headers,
+      });
+      if (state.status === "failed" || state.status === "cancelled") {
+        throw new Error(state.error && state.error.message ? state.error.message : "video generation failed");
+      }
+      if (state.video_url || state.url) {
+        return { url: state.video_url || state.url };
+      }
+      if (state.status === "completed") {
+        return await request({
+          method: "get",
+          url: \`\${baseUrl}/v1/videos/\${task.id}/content\`,
+          headers,
+          responseType: "blob",
+        });
+      }
+      return null;
+    },
+    (result) => result,
+    { intervalMs: 2500, timeoutMs: 300000 },
+  );
 }
 
 return await generateVideo({
@@ -675,8 +548,8 @@ return await generateVideo({
   audios,
   params,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
   poll,
 });`,
@@ -702,11 +575,9 @@ return await generateVideo({
  * @param {string} model
  * @param {string} baseUrl
  * @param {string} apiKey
- * @param {object} http
- * @param {AbortSignal} signal
  * @param {function} request
  * @param {function} poll
- * @returns {Promise<{url: string}|Blob>}
+ * @returns {Promise<{url: string}>}
  */
 async function generateVideo({
   prompt,
@@ -725,8 +596,6 @@ async function generateVideo({
   model,
   baseUrl,
   apiKey,
-  http,
-  signal,
   request,
   poll,
 }) {
@@ -734,10 +603,8 @@ async function generateVideo({
     if (typeof source === "string") {
       const match = source.match(/^data:([^;]+);base64,(.*)$/);
       return {
-        inlineData: {
-          data: match ? match[2] : "",
-          mimeType: match ? match[1] : "image/png",
-        },
+        bytesBase64Encoded: match ? match[2] : "",
+        mimeType: match ? match[1] : "image/png",
       };
     }
     const dataUrl = await new Promise((resolve, reject) => {
@@ -748,94 +615,24 @@ async function generateVideo({
     });
     const match = String(dataUrl).match(/^data:([^;]+);base64,(.*)$/);
     return {
-      inlineData: {
-        data: match ? match[2] : "",
-        mimeType: match ? match[1] : (source.type || "application/octet-stream"),
-      },
+      bytesBase64Encoded: match ? match[2] : "",
+      mimeType: match ? match[1] : (source.type || "application/octet-stream"),
     };
   }
 
-  function geminiBaseUrl(value) {
-    const normalized = String(value || "").trim();
-    try {
-      const url = new URL(normalized);
-      url.hash = "";
-      const pathname = url.pathname.replace(/\\/+$/, "");
-      if (!/\\/v1(?:beta)?$/i.test(pathname)) url.pathname = (pathname || "") + "/v1beta";
-      return url.toString();
-    } catch {
-      const fallback = normalized.replace(/\\/+$/, "");
-      return /\\/v1(?:beta)?$/i.test(fallback) ? fallback : fallback + "/v1beta";
-    }
+  const aspectRatioMap = {
+    "1280x720": "16:9",
+    "1920x1080": "16:9",
+    "720x1280": "9:16",
+    "1080x1920": "9:16",
+  };
+  let aspectRatio = ratio || size || "16:9";
+  if (aspectRatio === "auto") {
+    aspectRatio = "16:9";
   }
-
-  function appendGeminiPath(base, path) {
-    const url = new URL(base);
-    const suffix = new URL(path, url.origin);
-    const basePath = url.pathname.replace(/\\/+$/, "");
-    const suffixPath = suffix.pathname.replace(/^\\/+/, "");
-    url.pathname = (basePath || "") + "/" + suffixPath;
-    if (suffix.search) {
-      const params = new URLSearchParams(url.search);
-      suffix.searchParams.forEach((value, key) => params.append(key, value));
-      url.search = params.toString();
-    }
-    url.hash = "";
-    return url.toString();
+  if (aspectRatioMap[aspectRatio]) {
+    aspectRatio = aspectRatioMap[aspectRatio];
   }
-
-  function geminiModelName(value) {
-    return String(value || "").trim().replace(/^models\\//i, "");
-  }
-
-  const providerBaseUrl = geminiBaseUrl(baseUrl);
-  function sameOrigin(value) {
-    try {
-      return new URL(value, providerBaseUrl).origin === new URL(providerBaseUrl).origin;
-    } catch {
-      return false;
-    }
-  }
-
-  function withoutApiKey(value) {
-    try {
-      const url = new URL(value, providerBaseUrl);
-      const sensitiveNames = new Set(["key", "api_key", "apikey", "token", "access_token", "auth", "authorization"]);
-      for (const name of Array.from(url.searchParams.keys())) {
-        if (sensitiveNames.has(name.toLowerCase())) url.searchParams.delete(name);
-      }
-      return url.toString();
-    } catch {
-      return value;
-    }
-  }
-
-  function geminiOperationUrl(value) {
-    const name = String(value || "").trim();
-    if (!name) throw new Error("Gemini did not return an operation name");
-    if (/^(?:https?:\\/\\/|\\/\\/)/i.test(name)) {
-      if (!sameOrigin(name)) throw new Error("Gemini returned an operation URL on a different host");
-      return withoutApiKey(name);
-    }
-    const relative = name.replace(/^\\/+/, "").replace(/^v1beta\\//i, "").replace(/^v1\\//i, "");
-    return appendGeminiPath(providerBaseUrl, "/" + relative);
-  }
-
-  const ratioOptions = ["1:1", "3:4", "4:3", "16:9", "9:16", "21:9"];
-  function parseRatio(value) {
-    const match = String(value || "").match(/^(\\d+(?:\\.\\d+)?)[x:](\\d+(?:\\.\\d+)?)$/i);
-    if (!match) return null;
-    const width = Number(match[1]);
-    const height = Number(match[2]);
-    return width > 0 && height > 0 ? width / height : null;
-  }
-  function closestRatio(value) {
-    const target = parseRatio(value);
-    if (!target) return "16:9";
-    return ratioOptions.reduce((best, current) => Math.abs(parseRatio(current) - target) < Math.abs(parseRatio(best) - target) ? current : best);
-  }
-  const requestedRatio = ratio && ratio !== "auto" ? ratio : size;
-  const aspectRatio = requestedRatio && requestedRatio !== "auto" ? closestRatio(requestedRatio) : "16:9";
 
   const instance = {
     prompt: prompt,
@@ -869,7 +666,7 @@ async function generateVideo({
   };
   const op = await request({
     method: "post",
-    url: appendGeminiPath(providerBaseUrl, "/models/" + encodeURIComponent(geminiModelName(model)) + ":predictLongRunning"),
+    url: \`\${baseUrl}/v1beta/models/\${model}:predictLongRunning\`,
     headers,
     data: {
       instances: [instance],
@@ -882,12 +679,13 @@ async function generateVideo({
       },
     },
   });
-  if (!op || typeof op.name !== "string" || !op.name.trim()) {
-    throw new Error("Gemini did not return an operation name");
-  }
 
-  const result = await poll(
-    () => request({ method: "get", url: geminiOperationUrl(op.name), headers }),
+  return await poll(
+    () => request({
+      method: "get",
+      url: \`\${baseUrl}/v1beta/\${op.name}\`,
+      headers,
+    }),
     (state) => {
       if (state.error) {
         throw new Error(state.error.message || "video generation failed");
@@ -895,27 +693,12 @@ async function generateVideo({
       if (!state.done) return null;
       const uri = state.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri;
       if (!uri) throw new Error("Gemini did not return a video URI");
-      return { url: uri };
+      if (uri.includes("key=")) return { url: uri };
+      const separator = uri.includes("?") ? "&" : "?";
+      return { url: uri + separator + "key=" + apiKey };
     },
-    { intervalMs: ${VIDEO_POLL_INTERVAL_MS}, timeoutMs: ${VIDEO_POLL_TIMEOUT_MS} },
+    { intervalMs: 5000, timeoutMs: 300000 },
   );
-  const resultUrl = new URL(result.url, providerBaseUrl).toString();
-  if (!/^https?:\\/\\//i.test(resultUrl)) return result;
-  const sameProvider = sameOrigin(resultUrl);
-  const safeUrl = withoutApiKey(resultUrl);
-  try {
-    return await request({
-      method: "get",
-      // Preserve CDN signatures; only provider URLs use the configured API key.
-      url: sameProvider ? safeUrl : resultUrl,
-      headers: sameProvider ? { "x-goog-api-key": apiKey } : {},
-      responseType: "blob",
-    });
-  } catch (error) {
-    const crossOrigin = typeof location !== "undefined" && new URL(resultUrl).origin !== location.origin;
-    if (!sameProvider && crossOrigin && !signal?.aborted && error?.code === "ERR_NETWORK" && http.url(resultUrl) === resultUrl) return { url: resultUrl };
-    throw error;
-  }
 }
 
 return await generateVideo({
@@ -927,33 +710,9 @@ return await generateVideo({
   model,
   baseUrl,
   apiKey,
-  http,
-  signal,
   request,
   poll,
 });`,
-        },
-        {
-            label: i18n.t("modelPlugin.templates.openaiStandard"),
-            script: `// OpenAI Sora: standard multipart fields, with one optional input_reference.
-if (images.length > 1 || videos.length || audios.length) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSingleReference"))});
-const seconds = String(params.seconds || "").trim();
-if (!["4", "8", "12"].includes(seconds)) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSecondsUnsupported"))});
-const size = String(params.size || "").trim();
-if (size && !["720x1280", "1280x720", "1024x1792", "1792x1024"].includes(size)) throw new Error(${JSON.stringify(i18n.t("modelPlugin.templates.openaiVideoSizeUnsupported"))});
-const form = new FormData();
-form.set("model", model);
-form.set("prompt", prompt);
-form.set("seconds", seconds);
-if (size) form.set("size", size);
-if (images[0]) {
-  const response = await fetch(images[0], { signal });
-  if (!response.ok) throw new Error(${JSON.stringify(i18n.t("apiErrors.referenceImageReadFailed"))});
-  form.set("input_reference", await response.blob(), "reference.png");
-}
-const headers = { Authorization: \`Bearer \${apiKey}\` };
-const task = await request({ method: "post", url: http.url("/videos"), headers, data: form });
-${openaiVideoPolling}`,
         },
     ],
     audio: [
@@ -968,7 +727,7 @@ ${openaiVideoPolling}`,
  * @param {string|number} params.speed
  * @param {string} [params.instructions] - voice style instructions
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {function} request
  * @returns {Promise<Blob>}
@@ -982,13 +741,13 @@ async function generateAudio({
     instructions,
   },
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 }) {
   return await request({
     method: "post",
-    url: http.url("/audio/speech"),
+    url: \`\${baseUrl}/v1/audio/speech\`,
     headers: {
       "Content-Type": "application/json",
       Authorization: \`Bearer \${apiKey}\`,
@@ -1009,8 +768,8 @@ return await generateAudio({
   prompt,
   params,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 });`,
         },
@@ -1023,7 +782,7 @@ return await generateAudio({
  * @param {object} params
  * @param {string} params.voice - prebuilt voice name
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {function} request
  * @returns {Promise<{data: string}>}
@@ -1034,13 +793,13 @@ async function generateAudio({
     voice,
   },
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 }) {
   const data = await request({
     method: "post",
-    url: http.url("/models/" + encodeURIComponent(String(model || "").replace(/^models\\//i, "")) + ":generateContent", "v1beta"),
+    url: \`\${baseUrl}/v1beta/models/\${model}:generateContent\`,
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": apiKey,
@@ -1078,8 +837,8 @@ return await generateAudio({
   prompt,
   params,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
 });`,
         },
@@ -1089,9 +848,9 @@ return await generateAudio({
             label: i18n.t("modelPlugin.templates.openai"),
             script: `/**
  * OpenAI text: POST /v1/responses.
- * @param {{role: string, content: string}[]} messages - includes the system message when present
+ * @param {{role: string, content: string | object[]}[]} messages - text/image_url blocks; includes system messages
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {string} reasoningEffort - "auto" | "low" | "medium" | "high" | "xhigh"; omit reasoning when "auto"
  * @param {function} request
@@ -1101,54 +860,63 @@ return await generateAudio({
 async function generateText({
   messages,
   model,
+  baseUrl,
   apiKey,
   reasoningEffort,
-  http,
   request,
   onDelta,
 }) {
   const body = {
     model: model,
     input: messages.map((message) => ({
-      ...message,
-      content: Array.isArray(message.content) ? message.content.map((part) => part.type === "image_url"
-        ? { type: "input_image", image_url: part.image_url.url }
-        : { type: "input_text", text: part.text }) : message.content,
+      role: message.role,
+      content: Array.isArray(message.content)
+        ? message.content.map((part) => part.type === "text"
+          ? { type: "input_text", text: part.text }
+          : { type: "input_image", image_url: part.image_url.url })
+        : message.content,
     })),
-    store: false,
   };
   if (reasoningEffort && reasoningEffort !== "auto") {
     body.reasoning = {
       effort: reasoningEffort,
     };
   }
+  const url = new URL(baseUrl);
+  const path = url.pathname.replace(/\\/+$/, "");
+  url.pathname = path + (path.endsWith("/v1") ? "" : "/v1") + "/responses";
   const data = await request({
     method: "post",
-    url: http.url("/responses"),
+    url: url.toString(),
     headers: {
       "Content-Type": "application/json",
       Authorization: \`Bearer \${apiKey}\`,
     },
     data: body,
   });
-  const apiError = typeof data.error === "string" ? data.error : data.error?.message;
-  if (apiError) throw new Error(apiError);
-  if (data.status !== "completed") throw new Error(${JSON.stringify(i18n.t("apiErrors.textResponseIncomplete", { reason: "__REASON__" }))}.replace("__REASON__", data.incomplete_details?.reason || data.status || "missing_status"));
-  const content = (data.output || []).flatMap((item) => item.content || []);
-  const refusal = content.find((item) => item.refusal)?.refusal;
-  if (refusal) throw new Error(refusal);
-  const text = data.output_text || content.map((item) => item.text || "").join("");
-  if (!text.trim()) throw new Error(${JSON.stringify(i18n.t("apiErrors.noContent"))});
-  onDelta?.(text);
+  if (data?.error || typeof data?.code === "number" && data.code !== 0) {
+    throw new Error(data.error?.message || data.msg || "文本生成失败");
+  }
+  if (data?.status !== "completed") {
+    throw new Error(data?.incomplete_details?.reason || "文本生成未完整结束，请重试");
+  }
+  const parts = (data.output || []).flatMap((item) => item.content || []);
+  if (parts.some((part) => part.type === "refusal" || part.refusal)) {
+    throw new Error("模型拒绝生成内容，请调整输入后重试");
+  }
+  const text = typeof data.output_text === "string" ? data.output_text
+    : parts.filter((part) => part.type === "output_text").map((part) => part.text || "").join("");
+  if (!text.trim()) throw new Error("文本生成未返回内容");
+  onDelta(text);
   return text;
 }
 
 return await generateText({
   messages,
   model,
+  baseUrl,
   apiKey,
   reasoningEffort,
-  http,
   request,
   onDelta,
 });`,
@@ -1157,11 +925,11 @@ return await generateText({
             label: i18n.t("modelPlugin.templates.gemini"),
             script: `/**
  * Gemini text: POST models/{model}:generateContent.
- * System messages are skipped in contents; systemPrompt goes to systemInstruction.
- * @param {{role: string, content: string}[]} messages
+ * System messages go to systemInstruction; systemPrompt is a fallback.
+ * @param {{role: string, content: string | object[]}[]} messages - text/image_url blocks
  * @param {string} systemPrompt
  * @param {string} model
- * @param {object} http
+ * @param {string} baseUrl
  * @param {string} apiKey
  * @param {function} request
  * @param {function} onDelta - push streaming text
@@ -1171,57 +939,62 @@ async function generateText({
   messages,
   systemPrompt,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
   onDelta,
 }) {
-  const toParts = (content) => (Array.isArray(content) ? content : [{ type: "text", text: content }]).map((part) => {
-    if (part.type !== "image_url") return { text: part.text || "" };
-    const match = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-    return match ? { inlineData: { mimeType: match[1], data: match[2] } } : { fileData: { fileUri: part.image_url.url } };
-  });
   const contents = [];
+  const systemMessages = [];
   for (const message of messages) {
-    if (message.role === "system") continue;
+    if (message.role === "system") {
+      systemMessages.push(Array.isArray(message.content)
+        ? message.content.filter((part) => part.type === "text").map((part) => part.text).join("\\n")
+        : message.content);
+      continue;
+    }
     contents.push({
       role: message.role === "assistant" ? "model" : "user",
-      parts: toParts(message.content),
+      parts: Array.isArray(message.content) ? message.content.map((part) => {
+        if (part.type === "text") return { text: part.text };
+        const url = part.image_url.url;
+        const match = url.match(/^data:([^;,]+);base64,(.+)$/);
+        return match
+          ? { inlineData: { mimeType: match[1], data: match[2] } }
+          : { fileData: { fileUri: url, mimeType: "image/png" } };
+      }) : [{ text: message.content }],
     });
   }
   const body = {
     contents: contents,
   };
-  const systemText = messages.filter((message) => message.role === "system").map((message) => message.content).join("\\n\\n") || systemPrompt;
+  const systemText = systemMessages.filter(Boolean).join("\\n\\n") || systemPrompt;
   if (systemText) {
     body.systemInstruction = {
       parts: [{ text: systemText }],
     };
   }
+  const url = new URL(baseUrl);
+  const path = url.pathname.replace(/\\/+$/, "").replace(/\\/v1(?:beta)?$/, "");
+  url.pathname = path + "/v1beta/models/" + encodeURIComponent(model.replace(/^models\\//, "")) + ":generateContent";
   const data = await request({
     method: "post",
-    url: http.url("/models/" + encodeURIComponent(String(model || "").replace(/^models\\//i, "")) + ":generateContent", "v1beta"),
+    url: url.toString(),
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": apiKey,
     },
     data: body,
   });
-  const apiError = typeof data.error === "string" ? data.error : data.error?.message;
-  if (apiError) throw new Error(apiError);
-  const candidate = data.candidates?.[0];
-  const rejected = data.promptFeedback?.blockReason;
-  if (rejected) throw new Error(${JSON.stringify(i18n.t("apiErrors.geminiRejected", { reason: "__REASON__" }))}.replace("__REASON__", rejected));
+  if (data?.error) throw new Error(data.error.message || "文本生成失败");
+  if (data?.promptFeedback?.blockReason) throw new Error("模型拒绝生成内容：" + data.promptFeedback.blockReason);
+  const candidate = data?.candidates?.[0];
   if (candidate?.finishReason !== "STOP") {
-    const reason = candidate?.finishReason || "missing_finish_reason";
-    const message = !candidate?.finishReason || reason === "MAX_TOKENS"
-      ? ${JSON.stringify(i18n.t("apiErrors.textResponseIncomplete", { reason: "__REASON__" }))}
-      : ${JSON.stringify(i18n.t("apiErrors.geminiRejected", { reason: "__REASON__" }))};
-    throw new Error(message.replace("__REASON__", reason));
+    throw new Error("文本生成未完整结束：" + (candidate?.finishReason || "缺少结束标记"));
   }
-  const text = (candidate.content?.parts || []).filter((part) => !part.thought).map((part) => part.text || "").join("");
-  if (!text.trim()) throw new Error(${JSON.stringify(i18n.t("apiErrors.noContent"))});
-  onDelta?.(text);
+  const text = (candidate.content?.parts || []).filter((part) => part.thought !== true).map((part) => part.text || "").join("");
+  if (!text.trim()) throw new Error("文本生成未返回内容");
+  onDelta(text);
   return text;
 }
 
@@ -1229,8 +1002,8 @@ return await generateText({
   messages,
   systemPrompt,
   model,
+  baseUrl,
   apiKey,
-  http,
   request,
   onDelta,
 });`,

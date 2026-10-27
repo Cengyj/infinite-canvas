@@ -3,7 +3,9 @@ import { App } from "antd";
 import { useTranslation } from "react-i18next";
 import { APP_VERSION } from "@/constant/env";
 import { parseChangelog, type ReleaseInfo } from "@/lib/release";
-import { fetchLatestRelease, fetchLatestVersion } from "@/services/api/version-check";
+
+const latestVersionUrl = "https://raw.githubusercontent.com/basketikun/infinite-canvas/main/VERSION";
+const latestChangelogUrl = "https://raw.githubusercontent.com/basketikun/infinite-canvas/main/CHANGELOG.md";
 
 function readLocalReleases(): ReleaseInfo[] {
     return __APP_RELEASES__ || [];
@@ -34,7 +36,9 @@ export function useVersionCheck() {
 
     const checkLatestVersion = useCallback(async () => {
         try {
-            const version = await fetchLatestVersion();
+            const response = await fetch(latestVersionUrl);
+            if (!response.ok) return false;
+            const version = await response.text();
             setLatestVersion(version.trim() || currentVersion);
             return true;
         } catch {
@@ -46,15 +50,18 @@ export function useVersionCheck() {
         async (showMessage = false) => {
             setChecking(true);
             try {
-                const { version, changelog } = await fetchLatestRelease();
+                const [versionResponse, changelogResponse] = await Promise.all([fetch(latestVersionUrl), fetch(latestChangelogUrl)]);
+                if (!versionResponse.ok) throw new Error(t("version.readFailed"));
+                if (!changelogResponse.ok) throw new Error(t("version.changelogFailed"));
+                const [version, changelog] = await Promise.all([versionResponse.text(), changelogResponse.text()]);
                 setLatestVersion(version.trim() || currentVersion);
                 if (changelog.trim()) setReleases(parseChangelog(changelog));
                 if (showMessage) message.success(t("version.updated"));
                 return true;
-            } catch (error) {
+            } catch {
                 setLatestVersion(currentVersion);
                 setReleases(localReleases);
-                if (showMessage) message.error(error instanceof Error ? error.message : t("version.updateFailed"));
+                if (showMessage) message.error(t("version.updateFailed"));
                 return false;
             } finally {
                 setChecking(false);

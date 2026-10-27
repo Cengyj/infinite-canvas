@@ -7,7 +7,6 @@ import { useTranslation } from "react-i18next";
 import { readZip } from "@/lib/zip";
 import { setMediaBlob } from "@/services/file-storage";
 import { setImageBlob } from "@/services/image-storage";
-import { retainMediaReferences } from "@/services/media-references";
 import { CanvasDeleteProjectsDialog } from "@/components/canvas/canvas-delete-projects-dialog";
 import { CanvasProjectCard } from "@/components/canvas/canvas-project-card";
 import type { CanvasExportFile } from "@/types/canvas-export";
@@ -45,23 +44,18 @@ export default function CanvasPage() {
             const projectFile = zip.get("projects.json");
             if (!projectFile) throw new Error("missing projects.json");
             const data = JSON.parse(await projectFile.text()) as CanvasExportFile;
-            const releaseReferences = retainMediaReferences(() => data.projects);
-            try {
-                const writes = await Promise.allSettled(
-                    data.projects.flatMap((project) => project.files.map(async (item) => {
+            await Promise.all(
+                data.projects.flatMap((project) =>
+                    project.files.map(async (item) => {
                         const blob = zip.get(item.path);
-                        if (!blob) throw new Error(`Missing canvas file: ${item.path}`);
+                        if (!blob) return;
                         const typedBlob = blob.type ? blob : blob.slice(0, blob.size, item.mimeType);
                         await (item.storageKey.startsWith("image:") ? setImageBlob(item.storageKey, typedBlob) : setMediaBlob(item.storageKey, typedBlob));
-                    })),
-                );
-                const failed = writes.find((result) => result.status === "rejected");
-                if (failed?.status === "rejected") throw failed.reason;
-                data.projects.forEach((item) => importProject(item.project));
-                message.success(t("canvas.imported", { count: data.projects.length }));
-            } finally {
-                releaseReferences();
-            }
+                    }),
+                ),
+            );
+            data.projects.forEach((item) => importProject(item.project));
+            message.success(t("canvas.imported", { count: data.projects.length }));
         } catch {
             message.error(t("canvas.importFailed"));
         } finally {

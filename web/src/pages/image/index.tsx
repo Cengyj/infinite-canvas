@@ -7,24 +7,22 @@ import { useTranslation } from "react-i18next";
 
 import { ImageSettingsPanel } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
-import { PromptOptimizeDialog } from "@/components/prompt-optimize-dialog";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
-import { modelOptionLabel, resolveModelRequestConfig, resolveModelScript, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { MAX_OPENAI_EDIT_REFERENCES, requestEdit, requestGeneration } from "@/services/api/image";
-import { ensureImagePreview, getImagePreviewRevision, previewUrlFor, resolveImageUrl, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
-import { isGenerationLogDeleted, recordGenerationLogDeletions, withGenerationLogLock } from "@/services/generation-log-deletions";
+import { requestEdit, requestGeneration } from "@/services/api/image";
+import { deleteStoredImages, ensureImagePreview, getImagePreviewRevision, previewUrlFor, resolveImageUrl, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
-import { useMediaReferences } from "@/hooks/use-media-references";
-import { retainMediaReferences } from "@/services/media-references";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
+import { usePromptOptimizer } from "@/hooks/use-prompt-optimizer";
+import { buildPromptOptimizationContext, buildPromptOptimizationGenerationIdentity } from "@/lib/prompt-optimization";
 
 type GeneratedImage = {
     id: string;
@@ -65,20 +63,6 @@ type GenerationLog = {
 
 type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "size" | "count">;
 
-type PromptOptimizationSession = {
-    id: string;
-    prompt: string;
-    references: ReferenceImage[];
-    frameSize: string;
-    transparentBackground: boolean;
-};
-
-type PromptOptimizationBinding = {
-    prompt: string;
-    referenceIds: string[];
-    contextKey: string;
-};
-
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
 const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
@@ -97,7 +81,6 @@ export default function ImagePage() {
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const addAsset = useAssetStore((state) => state.addAsset);
-    const cleanupAssetImages = useAssetStore((state) => state.cleanupImages);
     const [prompt, setPrompt] = useState("");
     const [references, setReferences] = useState<ReferenceImage[]>([]);
     const [results, setResults] = useState<GenerationResult[]>([]);
@@ -106,8 +89,6 @@ export default function ImagePage() {
     const [logsOpen, setLogsOpen] = useState(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
-    const [promptOptimizationSession, setPromptOptimizationSession] = useState<PromptOptimizationSession | null>(null);
-    const [promptOptimizationBinding, setPromptOptimizationBinding] = useState<PromptOptimizationBinding | null>(null);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
     const [startedAt, setStartedAt] = useState(0);
     const [elapsedMs, setElapsedMs] = useState(0);
@@ -121,11 +102,15 @@ export default function ImagePage() {
     const updateAgentTask = useWorkbenchAgentStore((state) => state.updateTask);
     const processedCommandRef = useRef(0);
     const agentTaskIdRef = useRef<string | undefined>(undefined);
-    const referencesRef = useRef<ReferenceImage[]>([]);
-    const referenceEpochRef = useRef(0);
-    const generationEpochRef = useRef(0);
-    const generationControllerRef = useRef<AbortController | null>(null);
-    useMediaReferences(() => ({ references: referencesRef.current, results, promptOptimizationSession }));
+    const promptSessionRef = useRef(0);
+    const { openOptimizer, optimizerDialog } = usePromptOptimizer({
+        getInput: () => {
+            const generationConfig = { ...effectiveConfig, model: effectiveConfig.imageModel || effectiveConfig.model };
+            return { targetId: `image-workbench:${promptSessionRef.current}`, generationIdentity: buildPromptOptimizationGenerationIdentity("image", generationConfig), scenario: "image", prompt, references, context: buildPromptOptimizationContext("image", generationConfig, references) };
+        },
+        onApply: setPrompt,
+        disabled: running,
+    });
 
     const model = effectiveConfig.imageModel || effectiveConfig.model;
     const canGenerate = Boolean(prompt.trim());
@@ -139,54 +124,20 @@ export default function ImagePage() {
 
     useEffect(() => {
         void refreshLogs();
-        return () => {
-            referenceEpochRef.current += 1;
-            generationEpochRef.current += 1;
-            generationControllerRef.current?.abort();
-        };
     }, []);
-
-    const updateReferences = (update: ReferenceImage[] | ((value: ReferenceImage[]) => ReferenceImage[]), cleanupRemoved = false) => {
-        const nextReferences = typeof update === "function" ? update(referencesRef.current) : update;
-        referencesRef.current = nextReferences;
-        setReferences(nextReferences);
-        if (cleanupRemoved) cleanupAssetImages({ references: nextReferences });
-    };
-
-    const replaceReferences = (nextReferences: ReferenceImage[]) => {
-        referenceEpochRef.current += 1;
-        updateReferences(nextReferences, true);
-    };
-
-    const addReferenceInputs = async (inputs: Array<{ input: string | Blob; name: string }>, epoch = referenceEpochRef.current) => {
-        if (!inputs.length || epoch !== referenceEpochRef.current) return 0;
-        const uploaded: ReferenceImage[] = [];
-        const release = retainMediaReferences(() => uploaded);
-        try {
-            const settled = await Promise.allSettled(inputs.map(async ({ input, name }): Promise<ReferenceImage> => {
-                const image = await uploadImage(input);
-                const reference = { id: nanoid(), name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
-                uploaded.push(reference);
-                return reference;
-            }));
-            if (referenceEpochRef.current !== epoch) return 0;
-            const accepted = settled.filter((item): item is PromiseFulfilledResult<ReferenceImage> => item.status === "fulfilled").map((item) => item.value);
-            if (accepted.length) updateReferences((current) => [...current, ...accepted]);
-            if (settled.some((item) => item.status === "rejected")) message.error(t("common.imageReadFailed"));
-            return accepted.length;
-        } finally {
-            release();
-            if (referenceEpochRef.current !== epoch) cleanupAssetImages();
-        }
-    };
 
     const addReferences = async (files?: FileList | null) => {
         const imageFiles = Array.from(files || []).filter((file) => file.type.startsWith("image/"));
-        await addReferenceInputs(imageFiles.map((file) => ({ input: file, name: file.name })));
+        const nextReferences = await Promise.all(
+            imageFiles.map(async (file) => {
+                const image = await uploadImage(file);
+                return { id: nanoid(), name: file.name, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
+            }),
+        );
+        setReferences((value) => [...value, ...nextReferences]);
     };
 
     const addReferencesFromClipboard = async () => {
-        const epoch = referenceEpochRef.current;
         try {
             const items = await navigator.clipboard.read();
             const blobs = await Promise.all(items.flatMap((item) => item.types.filter((type) => type.startsWith("image/")).map((type) => item.getType(type))));
@@ -194,27 +145,41 @@ export default function ImagePage() {
                 message.error(t("imageWorkbench.clipboardEmpty"));
                 return;
             }
-            const added = await addReferenceInputs(blobs.map((blob, index) => ({ input: blob, name: `clipboard-${index + 1}.png` })), epoch);
-            if (added) message.success(t("imageWorkbench.clipboardAdded", { count: added }));
+            const nextReferences = await Promise.all(
+                blobs.map(async (blob, index) => {
+                    const image = await uploadImage(blob);
+                    return { id: nanoid(), name: `clipboard-${index + 1}.png`, type: image.mimeType, dataUrl: image.url, storageKey: image.storageKey };
+                }),
+            );
+            setReferences((value) => [...value, ...nextReferences]);
+            message.success(t("imageWorkbench.clipboardAdded", { count: nextReferences.length }));
         } catch {
             message.error(t("imageWorkbench.clipboardEmpty"));
         }
     };
 
     const generate = async () => {
-        if (generationControllerRef.current) return;
         const agentTaskId = agentTaskIdRef.current;
         agentTaskIdRef.current = undefined;
+        const text = prompt.trim();
+        if (!text) {
+            message.error(t("imageWorkbench.promptRequired"));
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.promptRequired") });
+            return;
+        }
+        if (!isAiConfigReady(effectiveConfig, model)) {
+            message.warning(t("workbench.configFirst"));
+            openConfigDialog(true);
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.configIncomplete") });
+            return;
+        }
+
         const snapshot = buildRequestSnapshot();
         if (!snapshot) {
             if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("imageWorkbench.invalidParams") });
             return;
         }
-        const controller = new AbortController();
-        generationControllerRef.current = controller;
-        const epoch = generationEpochRef.current;
-        const storedImages: GeneratedImage[] = [];
-        const release = retainMediaReferences(() => [snapshot, storedImages]);
+
         setElapsedMs(0);
         setRunning(true);
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
@@ -222,43 +187,34 @@ export default function ImagePage() {
         setResults(Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" })));
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
+
+        const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
+
+        const result = await Promise.allSettled(tasks);
+        const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
+        const successCount = successImages.length;
+        const failCount = generationCount - successCount;
+        const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
+        const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? t("workbench.generationFailed") : undefined;
+        if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
+
         try {
-            const result = await Promise.allSettled(Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot, controller, epoch, storedImages)));
-            if (controller.signal.aborted) return;
-            const successImages = result.filter((item): item is PromiseFulfilledResult<GeneratedImage> => item.status === "fulfilled").map((item) => item.value);
-            const successCount = successImages.length;
-            const failCount = generationCount - successCount;
-            const failed = result.find((item): item is PromiseRejectedResult => item.status === "rejected");
-            const error = failed?.reason instanceof Error ? failed.reason.message : failCount ? t("workbench.generationFailed") : undefined;
-            await saveLog(buildLog({
-                prompt: snapshot.text,
-                model: snapshot.config.model,
-                config: { ...snapshot.config, count: String(generationCount) },
-                references: snapshot.references,
-                durationMs: performance.now() - batchStartedAt,
-                successCount,
-                failCount,
-                status: successCount ? "success" : "failed",
-                images: successImages,
-            }));
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: successCount ? "succeeded" : "failed", successCount, failCount, error: successCount ? undefined : error });
-            successCount ? message.success(t("imageWorkbench.generated")) : message.error(error || t("workbench.generationFailed"));
-        } catch (error) {
-            if (!controller.signal.aborted) {
-                const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
-                message.error(errorMessage);
-                if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: errorMessage });
-            }
+            saveLog(
+                buildLog({
+                    prompt: text,
+                    model,
+                    config: { ...snapshot.config, count: String(generationCount) },
+                    references: snapshot.references,
+                    durationMs: performance.now() - batchStartedAt,
+                    successCount,
+                    failCount,
+                    status: successCount ? "success" : "failed",
+                    images: successImages,
+                }),
+            );
+            successCount ? message.success(t("imageWorkbench.generated")) : message.error(failed?.reason instanceof Error ? failed.reason.message : t("workbench.generationFailed"));
         } finally {
-            release();
-            if (generationControllerRef.current === controller) {
-                generationControllerRef.current = null;
-                setRunning(false);
-            }
-            if (controller.signal.aborted) {
-                if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: t("common.cancel") });
-                cleanupAssetImages();
-            }
+            setRunning(false);
         }
     };
 
@@ -266,12 +222,9 @@ export default function ImagePage() {
     useEffect(() => {
         if (!imageCommand || imageCommand.nonce === processedCommandRef.current) return;
         processedCommandRef.current = imageCommand.nonce;
+        promptSessionRef.current += 1;
         clearImageCommand();
-        if (typeof imageCommand.prompt === "string" || imageCommand.run) setPromptOptimizationSession(null);
-        if (typeof imageCommand.prompt === "string") {
-            setPrompt(imageCommand.prompt);
-            setPromptOptimizationBinding(null);
-        }
+        if (typeof imageCommand.prompt === "string") setPrompt(imageCommand.prompt);
         if (imageCommand.run && running) {
             if (imageCommand.taskId) updateAgentTask(imageCommand.taskId, { status: "failed", error: t("imageWorkbench.busy") });
             return;
@@ -293,39 +246,32 @@ export default function ImagePage() {
     };
 
     const addResultToReferences = async (image: GeneratedImage, index: number) => {
-        if (await addReferenceInputs([{ input: image.dataUrl, name: `result-${index + 1}.png` }])) message.success(t("imageWorkbench.addedReference"));
+        const stored = await uploadImage(image.dataUrl);
+        setReferences((value) => [...value, { id: nanoid(), name: `result-${index + 1}.png`, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
+        message.success(t("imageWorkbench.addedReference"));
     };
 
     const saveResultToAssets = async (image: GeneratedImage, index: number) => {
-        const retained: unknown[] = [image];
-        const release = retainMediaReferences(() => retained);
-        try {
-            const stored = await uploadImage(image.dataUrl);
-            retained.push(stored);
-            addAsset({
-                kind: "image",
-                title: t("imageWorkbench.resultTitle", { count: index + 1 }),
-                coverUrl: stored.url,
-                tags: [],
-                source: t("imageWorkbench.source"),
-                data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
-                metadata: { source: "image-page", prompt },
-            });
-            message.success(t("common.addedToAssets"));
-        } catch (error) {
-            message.error(error instanceof Error ? error.message : t("common.imageReadFailed"));
-        } finally {
-            release();
-            cleanupAssetImages();
-        }
+        const stored = await uploadImage(image.dataUrl);
+        addAsset({
+            kind: "image",
+            title: t("imageWorkbench.resultTitle", { count: index + 1 }),
+            coverUrl: stored.url,
+            tags: [],
+            source: t("imageWorkbench.source"),
+            data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
+            metadata: { source: "image-page", prompt },
+        });
+        message.success(t("common.addedToAssets"));
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
         if (payload.kind === "text") {
+            promptSessionRef.current += 1;
             setPrompt(payload.content);
-            setPromptOptimizationBinding(null);
         } else if (payload.kind === "image") {
-            await addReferenceInputs([{ input: payload.dataUrl, name: payload.title }]);
+            const stored = await uploadImage(payload.dataUrl);
+            setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey }]);
         } else {
             message.warning(t("imageWorkbench.unsupportedAsset"));
         }
@@ -333,11 +279,9 @@ export default function ImagePage() {
     };
 
     const createSession = () => {
-        generationEpochRef.current += 1;
+        promptSessionRef.current += 1;
         setPrompt("");
-        replaceReferences([]);
-        setPromptOptimizationSession(null);
-        setPromptOptimizationBinding(null);
+        setReferences([]);
         setResults([]);
         setElapsedMs(0);
         setStartedAt(0);
@@ -346,20 +290,8 @@ export default function ImagePage() {
     };
 
     const deleteSelectedLogs = () => {
-        const deletingIds = [...selectedLogIds];
-        const retainedResults = previewLog && deletingIds.includes(previewLog.id) ? [] : results;
-        void (async () => {
-            await Promise.all(
-                deletingIds.map((id) =>
-                    withGenerationLogLock("image", id, async () => {
-                        await recordGenerationLogDeletions("image", [id]);
-                        await logStore.removeItem(id);
-                    }),
-                ),
-            );
-            await refreshLogs();
-            cleanupAssetImages({ references, results: retainedResults });
-        })();
+        const imageKeys = logs.filter((log) => selectedLogIds.includes(log.id)).flatMap((log) => log.images.map((image) => image.storageKey).filter((key): key is string => Boolean(key)));
+        void Promise.all([deleteStoredImages(imageKeys), ...selectedLogIds.map((id) => logStore.removeItem(id))]).then(refreshLogs);
         if (previewLog && selectedLogIds.includes(previewLog.id)) {
             setPreviewLog(null);
             setResults([]);
@@ -368,23 +300,18 @@ export default function ImagePage() {
         setDeleteConfirmOpen(false);
     };
 
-    const saveLog = async (log: GenerationLog) => {
-        await withGenerationLogLock("image", log.id, async () => {
-            if (await isGenerationLogDeleted("image", log.id)) return;
-            await logStore.setItem(log.id, serializeLog(log));
-        }).then(refreshLogs);
+    const saveLog = (log: GenerationLog) => {
+        void logStore.setItem(log.id, serializeLog(log)).then(refreshLogs);
     };
 
     const refreshLogs = async () => setLogs(await readStoredLogs());
 
     const previewGenerationLog = async (log: GenerationLog) => {
+        promptSessionRef.current += 1;
         setPreviewLog(log);
         setLogsOpen(false);
         setPrompt(log.prompt);
-        generationEpochRef.current += 1;
-        replaceReferences(log.references || []);
-        setPromptOptimizationSession(null);
-        setPromptOptimizationBinding(null);
+        setReferences(log.references || []);
         if (log.config.imageModel || log.model) updateConfig("imageModel", log.config.imageModel || log.model);
         if (log.config.quality) updateConfig("quality", log.config.quality);
         if (log.config.size) updateConfig("size", log.config.size);
@@ -394,20 +321,8 @@ export default function ImagePage() {
 
     const buildRequestSnapshot = () => {
         const text = prompt.trim();
-        const currentReferences = referencesRef.current;
         if (!text) {
             message.error(t("imageWorkbench.promptRequired"));
-            return null;
-        }
-        const optimizedPrompt = promptOptimizationBinding?.prompt === text;
-        const referencesChanged = Boolean(
-            optimizedPrompt
-            && (promptOptimizationBinding.referenceIds.length !== currentReferences.length || promptOptimizationBinding.referenceIds.some((id, index) => id !== currentReferences[index]?.id)),
-        );
-        const contextChanged = Boolean(optimizedPrompt && promptOptimizationBinding.contextKey !== imageOptimizationContextKey(effectiveConfig.size, effectiveConfig.background === "transparent"));
-        if (referencesChanged || contextChanged) {
-            setPromptOptimizationBinding(null);
-            message.warning(t(`imageWorkbench.promptOptimization.${referencesChanged && contextChanged ? "referenceAndContextChanged" : referencesChanged ? "referenceChanged" : "contextChanged"}`));
             return null;
         }
         if (!isAiConfigReady(effectiveConfig, model)) {
@@ -415,47 +330,34 @@ export default function ImagePage() {
             openConfigDialog(true);
             return null;
         }
-        if (!resolveModelScript(effectiveConfig, model) && resolveModelRequestConfig(effectiveConfig, model).apiFormat === "openai" && currentReferences.length > MAX_OPENAI_EDIT_REFERENCES) {
-            message.warning(t("imageWorkbench.editReferenceLimit", { count: MAX_OPENAI_EDIT_REFERENCES }));
-            return null;
-        }
-        return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...currentReferences] };
+        return { text, config: { ...effectiveConfig, model, count: "1" }, references: [...references] };
     };
 
-    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, controller: AbortController, epoch: number, storedImages: GeneratedImage[]) => {
+    const runGenerationSlot = async (index: number, snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }) => {
         const itemStartedAt = performance.now();
         try {
-            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references, { signal: controller.signal }) : await requestGeneration(snapshot.config, snapshot.text, { signal: controller.signal });
+            const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references) : await requestGeneration(snapshot.config, snapshot.text);
             const image = result[0];
             if (!image) throw new Error(t("imageWorkbench.missingResult"));
-            const stored = await uploadImage(image.dataUrl, { signal: controller.signal });
+            const stored = await uploadImage(image.dataUrl);
             const nextImage: GeneratedImage = { id: image.id, dataUrl: stored.url, ...(stored.storageKey ? { storageKey: stored.storageKey } : {}), durationMs: performance.now() - itemStartedAt, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType };
-            storedImages.push(nextImage);
-            if (generationEpochRef.current === epoch) setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
+            setResults((value) => updateResultAt(value, index, { status: "success", image: nextImage }));
             return nextImage;
         } catch (error) {
-            if (!controller.signal.aborted && generationEpochRef.current === epoch) setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
+            setResults((value) => updateResultAt(value, index, { status: "failed", error: error instanceof Error ? error.message : t("workbench.generationFailed") }));
             throw error;
         }
     };
 
     const retryResult = async (index: number) => {
-        if (generationControllerRef.current) return;
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
-        const controller = new AbortController();
-        generationControllerRef.current = controller;
-        const storedImages: GeneratedImage[] = [];
-        const release = retainMediaReferences(() => [snapshot, storedImages]);
-        setRunning(true);
         setPreviewLog(null);
         setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
         const retryStartedAt = performance.now();
-        setStartedAt(retryStartedAt);
-        setElapsedMs(0);
         try {
-            const image = await runGenerationSlot(index, snapshot, controller, generationEpochRef.current, storedImages);
-            await saveLog(
+            const image = await runGenerationSlot(index, snapshot);
+            saveLog(
                 buildLog({
                     prompt: snapshot.text,
                     model,
@@ -469,13 +371,8 @@ export default function ImagePage() {
                 }),
             );
             message.success(t("workbench.retrySuccess"));
-        } catch (error) {
-            if (!controller.signal.aborted) message.error(error instanceof Error ? error.message : t("workbench.generationFailed"));
-        } finally {
-            release();
-            generationControllerRef.current = null;
-            setRunning(false);
-            if (controller.signal.aborted) cleanupAssetImages();
+        } catch {
+            // runGenerationSlot has already marked the result as failed.
         }
     };
 
@@ -494,8 +391,8 @@ export default function ImagePage() {
                     />
                 </aside>
 
-                <section className="grid gap-3 lg:min-h-0 lg:overflow-hidden xl:grid-cols-[420px_minmax(0,1fr)]">
-                    <div className="thin-scrollbar flex flex-col rounded-lg border border-stone-200 bg-card p-4 shadow-sm dark:border-stone-800 lg:min-h-0 lg:overflow-y-auto">
+                <section className="grid min-w-0 gap-3 lg:min-h-0 lg:overflow-hidden xl:grid-cols-[420px_minmax(0,1fr)]">
+                    <div className="thin-scrollbar flex min-w-0 flex-col rounded-lg border border-stone-200 bg-card p-4 shadow-sm dark:border-stone-800 lg:min-h-0 lg:overflow-y-auto">
                         <div>
                             <div className="flex items-start justify-between gap-3">
                                 <div className="min-w-0">
@@ -517,56 +414,21 @@ export default function ImagePage() {
                                 <div className="mb-2 flex w-full items-center gap-1.5 whitespace-nowrap">
                                     <span className="shrink-0 text-sm font-semibold">{t("workbench.prompt")}</span>
                                     <div className="grid min-w-0 flex-1 grid-cols-3 gap-1">
-                                        <Button
-                                            size="small"
-                                            className="!h-7 !w-full !min-w-0 !gap-1 !px-2 !text-xs max-[389px]:!px-1 max-[389px]:!text-[11px] max-[389px]:[&_.ant-btn-icon]:hidden"
-                                            icon={<BookOpen className="size-3.5" />}
-                                            title={t("workbench.viewPrompts")}
-                                            aria-label={t("workbench.viewPrompts")}
-                                            onClick={() => setPromptDialogOpen(true)}
-                                        >
-                                            {t("imageWorkbench.promptActions.prompts")}
+                                        <Button size="small" className="!h-7 !w-full !min-w-0 !gap-1 !px-2 !text-xs max-[389px]:!px-1 max-[389px]:!text-[11px] max-[389px]:[&_.ant-btn-icon]:!hidden"
+                                            icon={<BookOpen className="size-3.5" />} title={t("workbench.viewPrompts")} aria-label={t("workbench.viewPrompts")} onClick={() => setPromptDialogOpen(true)}>
+                                            {t("workbench.promptActions.prompts")}
                                         </Button>
-                                        <Button
-                                            size="small"
-                                            className="!h-7 !w-full !min-w-0 !gap-1 !px-2 !text-xs max-[389px]:!px-1 max-[389px]:!text-[11px] max-[389px]:[&_.ant-btn-icon]:hidden"
-                                            icon={<FolderPlus className="size-3.5" />}
-                                            title={t("workbench.viewAssets")}
-                                            aria-label={t("workbench.viewAssets")}
-                                            onClick={() => setAssetPickerOpen(true)}
-                                        >
-                                            {t("imageWorkbench.promptActions.assets")}
+                                        <Button size="small" className="!h-7 !w-full !min-w-0 !gap-1 !px-2 !text-xs max-[389px]:!px-1 max-[389px]:!text-[11px] max-[389px]:[&_.ant-btn-icon]:!hidden"
+                                            icon={<FolderPlus className="size-3.5" />} title={t("workbench.viewAssets")} aria-label={t("workbench.viewAssets")} onClick={() => setAssetPickerOpen(true)}>
+                                            {t("workbench.promptActions.assets")}
                                         </Button>
-                                        <Button
-                                            size="small"
-                                            className="!h-7 !w-full !min-w-0 !gap-1 !px-2 !text-xs max-[389px]:!px-1 max-[389px]:!text-[11px] max-[389px]:[&_.ant-btn-icon]:hidden"
-                                            icon={<WandSparkles className="size-3.5" />}
-                                            title={t("imageWorkbench.promptOptimization.action")}
-                                            aria-label={t("imageWorkbench.promptOptimization.action")}
-                                            disabled={running}
-                                            onClick={() =>
-                                                setPromptOptimizationSession({
-                                                    id: nanoid(),
-                                                    prompt,
-                                                    references: references.map((reference) => ({ ...reference })),
-                                                    frameSize: effectiveConfig.size,
-                                                    transparentBackground: effectiveConfig.background === "transparent",
-                                                })
-                                            }
-                                        >
-                                            {t("imageWorkbench.promptActions.optimize")}
+                                        <Button size="small" className="!h-7 !w-full !min-w-0 !gap-1 !px-2 !text-xs max-[389px]:!px-1 max-[389px]:!text-[11px] max-[389px]:[&_.ant-btn-icon]:!hidden"
+                                            icon={<WandSparkles className="size-3.5" />} title={t("promptOptimization.title")} aria-label={t("promptOptimization.title")} disabled={running} onClick={openOptimizer}>
+                                            {t("workbench.promptActions.optimize")}
                                         </Button>
                                     </div>
                                 </div>
-                                <Input.TextArea
-                                    value={prompt}
-                                    onChange={(event) => {
-                                        setPrompt(event.target.value);
-                                        setPromptOptimizationBinding(null);
-                                    }}
-                                    rows={7}
-                                    placeholder={t("imageWorkbench.promptPlaceholder")}
-                                />
+                                <Input.TextArea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={7} placeholder={t("imageWorkbench.promptPlaceholder")} />
                             </div>
 
                             <div className="min-w-0">
@@ -613,11 +475,11 @@ export default function ImagePage() {
                                         <div key={item.id} className="group relative size-20 shrink-0 overflow-hidden rounded-md border border-stone-200 dark:border-stone-800">
                                             <img src={previewUrlFor(item.storageKey) || item.dataUrl} alt={item.name} className="size-full object-cover" />
                                             <span className="absolute left-1 top-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{imageReferenceLabel(index)}</span>
-                                            <ReferenceOrderButtons index={index} total={references.length} onMove={(offset) => updateReferences((value) => moveListItem(value, index, offset))} />
+                                            <ReferenceOrderButtons index={index} total={references.length} onMove={(offset) => setReferences((value) => moveListItem(value, index, offset))} />
                                             <button
                                                 type="button"
                                                 className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex"
-                                                onClick={() => updateReferences((value) => value.filter((ref) => ref.id !== item.id), true)}
+                                                onClick={() => setReferences((value) => value.filter((ref) => ref.id !== item.id))}
                                                 aria-label={t("imageWorkbench.removeReference")}
                                             >
                                                 <Trash2 className="size-3.5" />
@@ -704,46 +566,14 @@ export default function ImagePage() {
                     <GenerationSettings config={effectiveConfig} model={model} updateConfig={updateConfig} openConfigDialog={openConfigDialog} />
                 </div>
             </Drawer>
-            <PromptSelectDialog
-                open={promptDialogOpen}
-                onOpenChange={setPromptDialogOpen}
-                onSelect={(value) => {
-                    setPrompt(value);
-                    setPromptOptimizationBinding(null);
-                }}
-            />
+            <PromptSelectDialog open={promptDialogOpen} onOpenChange={setPromptDialogOpen} onSelect={(value) => { promptSessionRef.current += 1; setPrompt(value); }} />
             <AssetPickerModal open={assetPickerOpen} defaultTab="my-assets" onInsert={(payload) => void insertPickedAsset(payload)} onClose={() => setAssetPickerOpen(false)} />
-            {promptOptimizationSession ? (
-                <PromptOptimizeDialog
-                    key={promptOptimizationSession.id}
-                    scenario="image"
-                    prompt={promptOptimizationSession.prompt}
-                    references={promptOptimizationSession.references}
-                    context={{ frameSize: promptOptimizationSession.frameSize, transparentBackground: promptOptimizationSession.transparentBackground }}
-                    disabled={running}
-                    onApply={(value) => {
-                        setPrompt(value);
-                        setPromptOptimizationBinding({
-                            prompt: value.trim(),
-                            referenceIds: promptOptimizationSession.references.map((reference) => reference.id),
-                            contextKey: imageOptimizationContextKey(promptOptimizationSession.frameSize, promptOptimizationSession.transparentBackground),
-                        });
-                        setPreviewLog(null);
-                        setPromptOptimizationSession(null);
-                        message.success(t("imageWorkbench.promptOptimization.applied"));
-                    }}
-                    onClose={() => setPromptOptimizationSession(null)}
-                />
-            ) : null}
             <Modal title={t("workbench.deleteLogs")} open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={deleteSelectedLogs} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
                 {t("workbench.deleteLogsConfirm", { count: selectedLogIds.length })}
             </Modal>
+            {optimizerDialog}
         </div>
     );
-}
-
-function imageOptimizationContextKey(frameSize: string, transparentBackground: boolean) {
-    return `${frameSize}|${transparentBackground}`;
 }
 
 function GenerationSettings({ config, model, updateConfig, openConfigDialog }: { config: AiConfig; model: string; updateConfig: UpdateAiConfig; openConfigDialog: (shouldPromptContinue?: boolean) => void }) {

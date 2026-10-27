@@ -1,6 +1,4 @@
 import i18n from "@/i18n";
-import { classifyNetworkFailure, isAbortError, isOriginNotAllowedFetchResponse } from "@/lib/network-errors";
-import { withLocalProxy } from "@/stores/use-config-store";
 import type { PromptSource } from "./prompt-source-presets";
 
 export type RawPrompt = {
@@ -25,22 +23,8 @@ export type RawPrompt = {
 type RunOptions = { signal?: AbortSignal };
 
 async function fetchSource(source: PromptSource, options?: RunOptions) {
-    const requestUrl = withLocalProxy(source.url);
-    let response: Response;
-    try {
-        response = await fetch(requestUrl, { cache: "no-store", signal: options?.signal });
-    } catch (error) {
-        if (isAbortError(error)) throw error;
-        const kind = classifyNetworkFailure(error, requestUrl);
-        if (kind === "cors") throw new Error(i18n.t("apiErrors.corsRequired"));
-        if (kind === "proxy") throw new Error(i18n.t("config.proxy.unreachable"));
-        if (kind === "network") throw new Error(i18n.t("apiErrors.requestFailed"));
-        throw error;
-    }
-    if (!response.ok) {
-        if (await isOriginNotAllowedFetchResponse(response, requestUrl)) throw new Error(i18n.t("config.proxy.originNotAllowed"));
-        throw new Error(i18n.t("config.promptSources.runtime.requestFailed", { status: response.status }));
-    }
+    const response = await fetch(source.url, { cache: "no-store", signal: options?.signal });
+    if (!response.ok) throw new Error(i18n.t("config.promptSources.runtime.requestFailed", { status: response.status }));
     return response.json();
 }
 

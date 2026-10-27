@@ -87,9 +87,9 @@ Connect token: xxxxxx
 前端不直接暴露 HTTP 接口给本机服务，优先由网页主动连接本机 Canvas Agent。当前 MVP 使用 SSE 接收本机事件，HTTP POST 上报画布状态和工具结果：
 
 ```txt
-网页 -> `GET /events?token=xxx&clientId=xxx`（原生 EventSource 暂以 query token 认证）
-网页 -> `POST /canvas/state?clientId=xxx`，请求头 `x-canvas-agent-token: xxx`
-网页 -> `POST /canvas/result`，请求头 `x-canvas-agent-token: xxx`
+网页 -> http://127.0.0.1:17371/events?token=xxx
+网页 -> http://127.0.0.1:17371/canvas/state?token=xxx
+网页 -> http://127.0.0.1:17371/canvas/result?token=xxx
 ```
 
 前端需要提供一个画布 Agent 控制层，内部调用现有 store / hook，不直接让外部操作 React 组件：

@@ -4,44 +4,52 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { CONFIG_VERSION, writeConfigFile, type CanvasAgentConfig } from "./config.js";
+import { writeConfigFile, type CanvasAgentConfig } from "./config.js";
 
-const sample: CanvasAgentConfig = { version: CONFIG_VERSION, url: "http://127.0.0.1:17371", token: "test-token" };
+const sample: CanvasAgentConfig = { url: "http://127.0.0.1:17371", token: "test-token" };
 
-function temporaryConfig() {
-    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-config-"));
-    return { directory, file: path.join(directory, "canvas-agent.json") };
+function makeTempBase(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "canvas-agent-config-test-"));
 }
 
-test("配置通过同目录临时文件原子替换且不遗留临时文件", (context) => {
-    const { directory, file } = temporaryConfig();
-    context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-    writeConfigFile(directory, file, sample);
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), sample);
-    assert.deepEqual(fs.readdirSync(directory), ["canvas-agent.json"]);
+// POSIX-only: chmod semantics differ on Windows, where these modes are advisory.
+const posix = process.platform === "win32" ? { skip: true } : {};
+
+test("writeConfigFile creates directory 0700 and file 0600", posix, () => {
+    const base = makeTempBase();
+    const dir = path.join(base, "nested-config");
+    const file = path.join(dir, "canvas-agent.json");
+    try {
+        writeConfigFile(dir, file, sample);
+        assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
 });
 
-test("非法配置拒绝覆盖现有文件", (context) => {
-    const { directory, file } = temporaryConfig();
-    context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-    writeConfigFile(directory, file, sample);
-    const current = fs.readFileSync(file, "utf8");
-    assert.throws(() => writeConfigFile(directory, file, { ...sample, version: 2 as 1 }), /Unsupported configuration version/);
-    assert.equal(fs.readFileSync(file, "utf8"), current);
+test("writeConfigFile tightens existing loose permissions", posix, () => {
+    const base = makeTempBase();
+    const dir = path.join(base, "existing-config");
+    const file = path.join(dir, "canvas-agent.json");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    fs.writeFileSync(file, "{}", { mode: 0o644 });
+    try {
+        writeConfigFile(dir, file, sample);
+        assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
 });
 
-test("配置版本缺失时拒绝写入", (context) => {
-    const { directory, file } = temporaryConfig();
-    context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-    assert.throws(() => writeConfigFile(directory, file, { url: sample.url, token: sample.token } as CanvasAgentConfig), /version: missing/);
-    assert.equal(fs.existsSync(file), false);
-});
-
-test("POSIX 下配置目录和文件使用私有权限", { skip: process.platform === "win32" }, (context) => {
-    const { directory, file } = temporaryConfig();
-    context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-    fs.chmodSync(directory, 0o755);
-    writeConfigFile(directory, file, sample);
-    assert.equal(fs.statSync(directory).mode & 0o777, 0o700);
-    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+test("writeConfigFile persists the config content", () => {
+    const base = makeTempBase();
+    const file = path.join(base, "canvas-agent.json");
+    try {
+        writeConfigFile(base, file, sample);
+        assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), sample);
+    } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+    }
 });

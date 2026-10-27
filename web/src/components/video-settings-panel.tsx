@@ -5,8 +5,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "@/i18n";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import { computeVideoSize, inferVideoRatio, parseVideoResolution, readVideoDimensions, VIDEO_SECONDS_MAX, VIDEO_SECONDS_MIN, videoRatioOptions } from "@/lib/media-size";
-import { isGrokVideoModel, normalizeVideoSeconds } from "@/lib/video-config";
+import { clampVideoSeconds, computeVideoSize, inferVideoRatio, parseVideoResolution, readVideoDimensions, VIDEO_SECONDS_MAX, VIDEO_SECONDS_MIN, videoRatioOptions } from "@/lib/media-size";
 import { type AiConfig } from "@/stores/use-config-store";
 
 const resolutionOptions = [
@@ -33,11 +32,7 @@ type VideoSettingsPanelProps = {
 
 export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5" }: VideoSettingsPanelProps) {
     const { t } = useTranslation();
-    const model = config.model || config.videoModel;
-    const grok = isGrokVideoModel(model);
-    const secondsRange = grok ? { min: 1, max: 15 } : videoSecondsRange;
-    const seconds = Number(normalizeVideoSeconds(config.videoSeconds || "6", model));
-    const ratios = grok ? videoRatioOptions.filter((item) => item.value !== "21:9") : videoRatioOptions;
+    const seconds = Number(clampVideoSeconds(config.videoSeconds || "6"));
     const videoMode = normalizeVideoModeValue(config.videoMode);
     const resolution = parseVideoResolution(config.vquality);
     const selectedRatio = inferVideoRatio(config.size || "auto");
@@ -74,7 +69,7 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
                 </SettingGroup>
                 <SettingGroup title={t("settingsPanels.video.ratio")} color={theme.node.muted}>
                     <div className="grid grid-cols-4 gap-2.5">
-                        {ratios.map((item) => (
+                        {videoRatioOptions.map((item) => (
                             <button
                                 key={item.value}
                                 type="button"
@@ -91,8 +86,8 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
                 </SettingGroup>
                 <SettingGroup title={t("settingsPanels.video.seconds")} color={theme.node.muted}>
                     <div className="flex items-center gap-3" onMouseDown={(event) => event.stopPropagation()}>
-                        <Slider className="min-w-0 flex-1" min={secondsRange.min} max={secondsRange.max} step={1} value={seconds} onChange={(value) => onConfigChange("videoSeconds", String(Array.isArray(value) ? value[0] : value))} />
-                        <SecondsInput value={seconds} model={model} range={secondsRange} theme={theme} onCommit={(value) => onConfigChange("videoSeconds", String(value))} />
+                        <Slider className="min-w-0 flex-1" min={VIDEO_SECONDS_MIN} max={VIDEO_SECONDS_MAX} step={1} value={seconds} onChange={(value) => onConfigChange("videoSeconds", String(Array.isArray(value) ? value[0] : value))} />
+                        <SecondsInput value={seconds} theme={theme} onCommit={(value) => onConfigChange("videoSeconds", String(value))} />
                         <span className="shrink-0 text-sm" style={{ color: theme.node.muted }}>s</span>
                     </div>
                 </SettingGroup>
@@ -119,9 +114,9 @@ export function videoSizeLabel(value: string) {
     return ratio === "auto" ? i18n.t("settingsPanels.video.adaptive") : ratio;
 }
 
-export function videoSecondsLabel(value: string, model = "") {
+export function videoSecondsLabel(value: string) {
     if (String(value).trim() === "-1") return i18n.t("settingsPanels.video.smart");
-    return `${normalizeVideoSeconds(value || "6", model)}s`;
+    return `${value || "6"}s`;
 }
 
 export function videoModeLabel(value: string) {
@@ -178,9 +173,9 @@ function ResolutionInput({ value, theme, onChange }: { value: string; theme: Can
     );
 }
 
-function SecondsInput({ value, model, range, theme, onCommit }: { value: number; model: string; range: { min: number; max: number }; theme: CanvasTheme; onCommit: (value: number) => void }) {
+function SecondsInput({ value, theme, onCommit }: { value: number; theme: CanvasTheme; onCommit: (value: number) => void }) {
     const commit = (input: HTMLInputElement) => {
-        const next = Number(normalizeVideoSeconds(input.value, model));
+        const next = Number(clampVideoSeconds(input.value));
         input.value = String(next);
         onCommit(next);
     };
@@ -189,8 +184,8 @@ function SecondsInput({ value, model, range, theme, onCommit }: { value: number;
         <label className="flex h-9 w-[68px] shrink-0 overflow-hidden rounded-xl text-sm" style={{ background: theme.node.fill, color: theme.node.text }}>
             <input
                 type="number"
-                min={range.min}
-                max={range.max}
+                min={VIDEO_SECONDS_MIN}
+                max={VIDEO_SECONDS_MAX}
                 className="min-w-0 flex-1 bg-transparent px-2 text-center outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                 defaultValue={value}
                 key={value}

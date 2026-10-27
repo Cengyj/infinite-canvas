@@ -1,8 +1,8 @@
 import { saveAs } from "file-saver";
 
 import i18n from "@/i18n";
-import { defaultConfig, defaultWebdavSyncConfig, useConfigStore, type AiConfig, type WebdavSyncConfig } from "@/stores/use-config-store";
-import { normalizePromptSourceState, usePromptSourceStore, type PromptSourceState } from "@/stores/use-prompt-source-store";
+import { useConfigStore, type AiConfig, type WebdavSyncConfig } from "@/stores/use-config-store";
+import { usePromptSourceStore, type PromptSourceSchedule } from "@/stores/use-prompt-source-store";
 import type { PromptSource } from "@/services/api/prompt-source-presets";
 
 type AppConfigFile = {
@@ -13,14 +13,8 @@ type AppConfigFile = {
     webdav: WebdavSyncConfig;
     promptSources: {
         sources: PromptSource[];
-        schedule: PromptSourceState["schedule"];
+        schedule: PromptSourceSchedule;
     };
-};
-
-type ImportedAppConfigFile = Omit<AppConfigFile, "config" | "webdav" | "promptSources"> & {
-    config: Partial<AiConfig>;
-    webdav: Partial<WebdavSyncConfig>;
-    promptSources: Partial<PromptSourceState>;
 };
 
 export function exportAppConfig() {
@@ -31,48 +25,13 @@ export function exportAppConfig() {
 }
 
 export async function importAppConfig(file: File) {
-    let data: unknown;
+    let data: AppConfigFile;
     try {
-        data = JSON.parse(await file.text());
+        data = JSON.parse(await file.text()) as AppConfigFile;
     } catch {
         throw new Error(i18n.t("config.invalidFile"));
     }
-    if (!isAppConfigFile(data)) throw new Error(i18n.t("config.invalidFile"));
-    let promptSources: PromptSourceState;
-    try {
-        promptSources = normalizePromptSourceState(data.promptSources);
-        useConfigStore.getState().replaceConfig(data.config, data.webdav);
-    } catch {
-        throw new Error(i18n.t("config.invalidFile"));
-    }
-    usePromptSourceStore.setState(promptSources);
-}
-
-function isAppConfigFile(value: unknown): value is ImportedAppConfigFile {
-    if (!isRecord(value) || value.app !== "infinite-canvas" || value.version !== 1 || typeof value.exportedAt !== "string" || !isRecord(value.config) || !isRecord(value.webdav) || !isRecord(value.promptSources)) return false;
-    const config = value.config;
-    const webdav = value.webdav;
-    const promptSources = value.promptSources;
-    const scalarConfigKeys = Object.keys(defaultConfig).filter((key) => key !== "channels" && key !== "models");
-    if (!scalarConfigKeys.every((key) => config[key] === undefined || typeof config[key] === typeof defaultConfig[key as keyof AiConfig])) return false;
-    if (config.models !== undefined && (!Array.isArray(config.models) || !config.models.every((model) => typeof model === "string"))) return false;
-    if (config.channels !== undefined && (!Array.isArray(config.channels) || !config.channels.every(isChannel))) return false;
-    if (!Object.keys(defaultWebdavSyncConfig).every((key) => webdav[key] === undefined || typeof webdav[key] === "string")) return false;
-    const sources = promptSources.sources;
-    const schedule = promptSources.schedule;
-    return Array.isArray(sources) && sources.every(isPromptSource) && isRecord(schedule) && (schedule.intervalMinutes === undefined || (typeof schedule.intervalMinutes === "number" && Number.isFinite(schedule.intervalMinutes))) && (schedule.lastFetchedAt === undefined || typeof schedule.lastFetchedAt === "string");
-}
-
-function isChannel(value: unknown) {
-    if (!isRecord(value) || !["id", "name", "baseUrl", "apiKey"].every((key) => value[key] === undefined || typeof value[key] === "string")) return false;
-    if (value.apiFormat !== undefined && value.apiFormat !== "openai" && value.apiFormat !== "gemini") return false;
-    return value.models === undefined || (Array.isArray(value.models) && value.models.every((model) => typeof model === "string" || (isRecord(model) && typeof model.name === "string" && (model.capability === undefined || ["image", "video", "text", "audio"].includes(String(model.capability))) && (model.script === undefined || typeof model.script === "string"))));
-}
-
-function isPromptSource(value: unknown) {
-    return isRecord(value) && ["id", "name", "url", "homepage"].every((key) => value[key] === undefined || typeof value[key] === "string") && ["enabled", "builtIn"].every((key) => value[key] === undefined || typeof value[key] === "boolean");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+    if (data.app !== "infinite-canvas" || data.version !== 1 || !data.config || !data.webdav || !data.promptSources) throw new Error(i18n.t("config.invalidFile"));
+    useConfigStore.setState({ config: data.config, webdav: data.webdav });
+    usePromptSourceStore.setState(data.promptSources);
 }

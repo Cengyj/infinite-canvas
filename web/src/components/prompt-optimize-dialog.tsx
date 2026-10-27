@@ -1,407 +1,248 @@
-import { ArrowRight, Copy, Square, WandSparkles } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { App, Button, Input, Modal, Switch, Tag, Tooltip, type ModalProps } from "antd";
+import { type ClipboardEvent, useEffect, useId, useRef, useState } from "react";
+import { Alert, App, Button, Input, Modal, Switch, Tooltip, theme } from "antd";
+import { ArrowRight, Check, Copy, Image as ImageIcon, LoaderCircle, RefreshCw, Square, WandSparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
 import { useCopyText } from "@/hooks/use-copy-text";
-import { useMediaReferences } from "@/hooks/use-media-references";
-import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
-import { MAX_PROMPT_OPTIMIZATION_REFERENCES, requestPromptOptimization, type PromptOptimizationContext, type PromptOptimizationScenario } from "@/services/api/prompt-optimization";
-import { resolveModelForCapability, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
-import { useThemeStore } from "@/stores/use-theme-store";
-import type { ReferenceImage } from "@/types/image";
+import { promptOptimizationTokens, type PromptOptimizationInput } from "@/lib/prompt-optimization";
+import { requestPromptOptimization } from "@/services/api/prompt-optimization";
+import { modelCapabilityOf, resolveModelRequestConfig, resolveModelScript, useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 
-type PromptOptimizeDialogProps = {
-    scenario: PromptOptimizationScenario;
-    prompt: string;
-    references: ReferenceImage[];
-    context?: PromptOptimizationContext;
-    appearance?: "workbench" | "canvas";
-    disabled?: boolean;
-    onApply: (prompt: string) => void;
+type Props = {
+    input: PromptOptimizationInput;
+    stale: boolean;
+    onRefresh: () => void;
+    onApply: (value: string) => void;
     onClose: () => void;
 };
 
-type PromptOptimizeSnapshot = {
-    sourcePrompt: string;
-    requirements: string;
-    draft: string;
-    draftComplete: boolean;
-    draftStale: boolean;
-    analyzeReferences: boolean;
-};
-
-const MODAL_STYLES: ModalProps["styles"] = {
-    body: { maxHeight: "calc(100vh - 190px)", overflowY: "auto" },
-};
-
-export function PromptOptimizeDialog({ scenario, prompt, references, context, appearance = "workbench", disabled = false, onApply, onClose }: PromptOptimizeDialogProps) {
-    useMediaReferences(() => references);
-    const { message } = App.useApp();
+export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose }: Props) {
     const { t } = useTranslation();
+    const { token } = theme.useToken();
+    const { message } = App.useApp();
     const copyText = useCopyText();
-    const canvasThemeName = useThemeStore((state) => state.theme);
-    const canvasTheme = canvasThemes[canvasThemeName];
     const config = useEffectiveConfig();
-    const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const updateConfig = useConfigStore((state) => state.updateConfig);
-    const textModel = resolveModelForCapability(config, config.textModel, "text");
-    const referencesWithinLimit = references.length <= MAX_PROMPT_OPTIMIZATION_REFERENCES;
-    const [sourcePrompt, setSourcePrompt] = useState(prompt);
+    const ready = useConfigStore((state) => state.isAiConfigReady);
+    const textModel = config.textModel;
+    const configReady = modelCapabilityOf(config, textModel) === "text" && ready(config, textModel);
+    const [source, setSource] = useState(input.prompt);
     const [requirements, setRequirements] = useState("");
-    const [draft, setDraft] = useState("");
-    const [draftComplete, setDraftComplete] = useState(false);
-    const [draftStale, setDraftStale] = useState(false);
     const [analyzeReferences, setAnalyzeReferences] = useState(false);
-    const [optimizing, setOptimizing] = useState(false);
-    const requestRef = useRef<AbortController | null>(null);
-    const requestSnapshotRef = useRef<PromptOptimizeSnapshot | null>(null);
-    const textModelRef = useRef<string | null>(null);
-    const configReady = Boolean(textModel && isAiConfigReady(config, textModel));
-    const canvasAppearance = appearance === "canvas";
-    const namespace = scenario === "image" ? "imageWorkbench" : "videoWorkbench";
-    const text = (key: string, options?: Record<string, unknown>) => t(`${namespace}.promptOptimization.${key}`, options);
-    const mutedTextClass = canvasAppearance ? "" : "text-stone-500 dark:text-stone-400";
-    const mutedTextStyle = canvasAppearance ? { color: canvasTheme.node.muted } : undefined;
-    const inputStyle = canvasAppearance ? { background: "transparent" } : undefined;
-    const modalStyles: ModalProps["styles"] = canvasAppearance
-        ? {
-              container: {
-                  background: canvasTheme.toolbar.panel,
-                  border: `1px solid ${canvasTheme.toolbar.border}`,
-                  borderRadius: 20,
-                  boxShadow: canvasThemeName === "dark" ? "0 22px 70px rgba(0,0,0,.46)" : "0 22px 70px rgba(28,25,23,.14)",
-                  color: canvasTheme.node.text,
-              },
-              header: { background: "transparent", color: canvasTheme.node.text },
-              body: { maxHeight: "calc(100dvh - 176px)", overflowY: "auto" },
-              footer: { background: "transparent", borderTop: `1px solid ${canvasTheme.toolbar.border}`, paddingTop: 12 },
-          }
-        : MODAL_STYLES;
-
-    useEffect(
-        () => () => {
-            const request = requestRef.current;
-            requestRef.current = null;
-            requestSnapshotRef.current = null;
-            request?.abort();
-        },
-        [],
-    );
-
-    useEffect(() => {
-        if (textModelRef.current === null) {
-            textModelRef.current = textModel;
-            return;
-        }
-        if (textModelRef.current === textModel) return;
-        textModelRef.current = textModel;
-        requestRef.current?.abort();
-        requestRef.current = null;
-        requestSnapshotRef.current = null;
-        setOptimizing(false);
-        clearDraft();
-    }, [textModel]);
-
-    useEffect(() => {
-        if (!disabled || !requestRef.current) return;
-        requestRef.current.abort();
-        requestRef.current = null;
-        restoreSnapshot();
-    }, [disabled]);
-
-    function clearDraft() {
-        setDraft("");
-        setDraftComplete(false);
-        setDraftStale(false);
-    }
-
-    function restoreSnapshot() {
-        const snapshot = requestSnapshotRef.current;
-        requestSnapshotRef.current = null;
-        setOptimizing(false);
-        if (!snapshot) return;
-        setSourcePrompt(snapshot.sourcePrompt);
-        setRequirements(snapshot.requirements);
-        setDraft(snapshot.draft);
-        setDraftComplete(snapshot.draftComplete);
-        setDraftStale(snapshot.draftStale);
-        setAnalyzeReferences(snapshot.analyzeReferences);
-    }
-
-    const close = () => {
-        requestRef.current?.abort();
-        requestRef.current = null;
-        requestSnapshotRef.current = null;
-        onClose();
-    };
+    const [result, setResult] = useState<{ text: string; signature: string } | null>(null);
+    const [preview, setPreview] = useState<string | null>(null);
+    const [error, setError] = useState("");
+    const controllerRef = useRef<AbortController | null>(null);
+    const previousSource = useRef<string | null>(null);
+    const busy = preview !== null;
+    const requestConfig = resolveModelRequestConfig(config, textModel);
+    // This key stays in memory and also detects a changed key, protocol, or saved call script.
+    const modelKey = JSON.stringify([textModel, requestConfig.baseUrl, requestConfig.apiKey, requestConfig.apiFormat, resolveModelScript(config, textModel), config.reasoningEffort, config.proxyEnabled, config.proxyUrl]);
+    const latestRequestState = useRef({ modelKey, stale, configReady });
+    latestRequestState.current = { modelKey, stale, configReady };
+    const signature = JSON.stringify([source, requirements, analyzeReferences, modelKey]);
+    const draft = preview ?? result?.text ?? "";
+    const originalTokens = JSON.stringify(promptOptimizationTokens(input.prompt));
+    const sourceTokensValid = JSON.stringify(promptOptimizationTokens(source)) === originalTokens;
+    const tokensValid = JSON.stringify(promptOptimizationTokens(draft)) === originalTokens;
+    const resultStale = Boolean(result && result.signature !== signature);
+    const canContinue = Boolean(result?.text.trim() && !busy && !stale && configReady && sourceTokensValid && tokensValid);
+    const canApply = canContinue && !resultStale;
+    const text = (key: string) => t(`promptOptimization.${key}`);
 
     const stop = () => {
-        requestRef.current?.abort();
-        requestRef.current = null;
-        restoreSnapshot();
+        controllerRef.current?.abort();
+        controllerRef.current = null;
+        if (previousSource.current !== null) setSource(previousSource.current);
+        previousSource.current = null;
+        setPreview(null);
     };
 
-    const optimize = async (nextSource = sourcePrompt) => {
-        const source = nextSource.trim();
-        if (!source) {
-            message.warning(t(`${namespace}.promptRequired`));
-            return;
-        }
-        if (!configReady) {
-            message.warning(text("configRequired"));
-            openConfigDialog(false);
-            return;
-        }
-        if (requestRef.current) return;
+    useEffect(() => () => controllerRef.current?.abort(), []);
+    useEffect(() => {
+        if (stale || !configReady) stop();
+    }, [stale, configReady]);
+    useEffect(() => {
+        stop();
+    }, [modelKey]);
 
+    const optimize = async (nextSource = source) => {
+        if (controllerRef.current || stale || !nextSource.trim() || JSON.stringify(promptOptimizationTokens(nextSource)) !== originalTokens) return;
+        if (!configReady) {
+            message.warning(text("errors.modelUnavailable"));
+            return;
+        }
         const controller = new AbortController();
-        requestRef.current = controller;
-        requestSnapshotRef.current = { sourcePrompt, requirements, draft, draftComplete, draftStale, analyzeReferences };
-        setSourcePrompt(source);
-        clearDraft();
-        setOptimizing(true);
+        controllerRef.current = controller;
+        previousSource.current = source;
+        setSource(nextSource);
+        setError("");
+        setPreview("");
+        const requestSignature = JSON.stringify([nextSource, requirements, analyzeReferences, modelKey]);
+        const isActive = () => controllerRef.current === controller && !controller.signal.aborted && !latestRequestState.current.stale && latestRequestState.current.configReady && latestRequestState.current.modelKey === modelKey;
         try {
-            const result = await requestPromptOptimization(
-                config,
-                textModel,
-                { scenario, prompt: source, requirements, references, analyzeReferences, context },
-                (value) => {
-                    if (requestRef.current === controller) setDraft(value);
-                },
-                controller.signal,
-            );
-            if (requestRef.current !== controller) return;
-            setDraft(result);
-            setDraftComplete(true);
-            setDraftStale(false);
-            requestSnapshotRef.current = null;
-        } catch (error) {
-            if (requestRef.current !== controller) return;
-            const canceled = controller.signal.aborted;
-            if (!canceled) controller.abort();
-            restoreSnapshot();
-            if (!canceled) message.error(error instanceof Error ? error.message : text("failed"));
+            const value = await requestPromptOptimization(config, textModel, { ...input, prompt: nextSource, requirements, analyzeReferences }, (value) => {
+                if (isActive()) setPreview(value);
+            }, controller.signal);
+            if (!isActive()) return;
+            setResult({ text: value, signature: requestSignature });
+            previousSource.current = null;
+        } catch (cause) {
+            if (isActive()) {
+                if (previousSource.current !== null) setSource(previousSource.current);
+                previousSource.current = null;
+                setError(cause instanceof Error ? cause.message : text("failed"));
+            }
         } finally {
-            if (requestRef.current === controller) {
-                requestRef.current = null;
-                setOptimizing(false);
+            if (controllerRef.current === controller) {
+                controllerRef.current = null;
+                setPreview(null);
             }
         }
     };
 
-    const hasDraft = Boolean(draft.trim());
-    const hasCompleteDraft = draftComplete && hasDraft;
-    const resultStatus = optimizing ? "running" : draftStale ? "stale" : hasCompleteDraft ? "ready" : "waiting";
-    const referenceHint = !referencesWithinLimit
-        ? text("referenceLimit", { count: MAX_PROMPT_OPTIMIZATION_REFERENCES })
-        : analyzeReferences
-          ? text("analyzeReferencesHint", { count: MAX_PROMPT_OPTIMIZATION_REFERENCES })
-          : text("referencesTextOnly", { count: references.length });
+    const close = () => { stop(); onClose(); };
+    const status = busy ? "running" : stale || resultStale ? "outdated" : result ? "ready" : "waiting";
+    const refs = input.context.referenceTokens || [];
 
     return (
-        <Modal
-            centered
-            open
-            width={canvasAppearance ? 860 : 880}
-            zIndex={canvasAppearance ? 1120 : 1050}
-            keyboard={!optimizing}
-            mask={{ closable: !optimizing }}
-            closable={!optimizing}
-            style={canvasAppearance ? { maxWidth: "calc(100vw - 24px)" } : undefined}
-            styles={modalStyles}
-            title={
-                <span className="flex items-center gap-2" style={canvasAppearance ? { color: canvasTheme.node.text } : undefined}>
-                    <WandSparkles className="size-4" />
-                    {text("title")}
-                </span>
-            }
-            onCancel={close}
-            footer={
-                <div className="flex flex-col-reverse gap-2 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="flex flex-wrap gap-2">
-                        {optimizing ? (
-                            <Button type={canvasAppearance ? "text" : undefined} danger icon={<Square className="size-3.5 fill-current" />} onClick={stop}>
-                                {text("stop")}
-                            </Button>
-                        ) : (
-                            <Button type={canvasAppearance ? "text" : undefined} icon={<WandSparkles className="size-4" />} disabled={disabled || !sourcePrompt.trim()} onClick={() => void optimize()}>
-                                {hasDraft ? text("reoptimize") : text("optimize")}
-                            </Button>
-                        )}
-                        {hasCompleteDraft ? (
-                            <Button type={canvasAppearance ? "text" : undefined} icon={<ArrowRight className="size-4" />} disabled={disabled || optimizing} onClick={() => void optimize(draft)}>
-                                {text("continue")}
-                            </Button>
-                        ) : null}
-                    </div>
-                    <div className="flex justify-end gap-2">
-                        <Button type={canvasAppearance ? "text" : undefined} disabled={optimizing} onClick={close}>{t("common.cancel")}</Button>
-                        <Button type="primary" disabled={disabled || optimizing || draftStale || !hasCompleteDraft} onClick={() => onApply(draft.trim())}>
-                            {text("apply")}
-                        </Button>
-                    </div>
+        <Modal open centered width={960} zIndex={1000} onCancel={close} mask={{ closable: !busy }}
+            style={{ maxWidth: "calc(100vw - 24px)" }}
+            styles={{ body: { maxHeight: "calc(100dvh - 190px)", overflowY: "auto", paddingTop: 12 }, footer: { borderTop: `1px solid ${token.colorBorderSecondary}`, paddingTop: 14 } }}
+            title={<div className="flex items-center gap-2.5"><WandSparkles className="size-4" /><span>{text("title")}</span><span className="ml-1 text-xs font-normal" style={{ color: token.colorTextSecondary }}>{text(input.scenario === "image" ? "image" : "video")}</span></div>}
+            footer={<div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs" style={{ color: token.colorTextSecondary }}>{text("applyHint")}</span>
+                <div className="flex items-center gap-1.5">
+                    <Button type="text" onClick={close}>{t("common.cancel")}</Button>
+                    <Button type="primary" icon={<Check className="size-4" />} disabled={!canApply} onClick={() => canApply && result && onApply(result.text.trim())}>{text("apply")}</Button>
                 </div>
-            }
+            </div>}
         >
-            <div className="space-y-4 pt-1">
-                <p className={`m-0 text-sm ${mutedTextClass}`} style={mutedTextStyle}>{text("description")}</p>
-                <div
-                    className={canvasAppearance ? "rounded-xl border p-3" : "rounded-lg border border-stone-200 bg-stone-50 p-3 dark:border-stone-800 dark:bg-stone-900"}
-                    style={canvasAppearance ? { background: "transparent", borderColor: canvasTheme.toolbar.border } : undefined}
-                >
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                        <div className="min-w-0">
-                            <div className="text-sm font-medium">{text("model")}</div>
-                            <div className={`mt-1 text-xs ${mutedTextClass}`} style={mutedTextStyle}>
-                                {references.length ? text("referenceCount", { count: references.length }) : text("noReferences")}
-                            </div>
-                        </div>
-                        <div className="w-full sm:w-72">
-                            <ModelPicker
-                                config={config}
-                                value={textModel}
-                                capability="text"
-                                fullWidth
-                                disabled={disabled || optimizing}
-                                onChange={(value) => {
-                                    updateConfig("textModel", value);
-                                    clearDraft();
-                                }}
-                                onMissingConfig={() => openConfigDialog(false)}
-                            />
-                        </div>
+            <div className="space-y-5" data-canvas-no-zoom onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => { if (event.key !== "Escape") event.stopPropagation(); }}>
+                <div className="flex flex-wrap items-end justify-between gap-3">
+                    <div className="min-w-0 flex-1 sm:max-w-80">
+                        <div className="mb-2 text-xs font-medium" style={{ color: token.colorTextSecondary }}>{text("model")}</div>
+                        <ModelPicker config={config} value={textModel} capability="text" fullWidth disabled={busy} className="!h-9 !rounded-lg !shadow-none" onChange={(value) => updateConfig("textModel", value)} onMissingConfig={() => openConfigDialog(false, "channels")} />
                     </div>
-                    {references.length ? (
-                        <div className={canvasAppearance ? "mt-3 border-t pt-3" : "mt-3 border-t border-stone-200 pt-3 dark:border-stone-800"} style={canvasAppearance ? { borderColor: canvasTheme.toolbar.border } : undefined}>
-                            <div className="flex items-start justify-between gap-4">
-                                <div className="min-w-0">
-                                    <div className="text-sm font-medium">{text("analyzeReferences")}</div>
-                                    <div className={`mt-1 text-xs leading-5 ${mutedTextClass}`} style={mutedTextStyle}>
-                                        {referenceHint}
-                                    </div>
-                                </div>
-                                <Switch
-                                    className="mt-0.5 shrink-0"
-                                    checked={analyzeReferences}
-                                    disabled={disabled || optimizing || !referencesWithinLimit}
-                                    aria-label={text("analyzeReferences")}
-                                    onChange={(checked) => {
-                                        setAnalyzeReferences(checked);
-                                        clearDraft();
-                                    }}
-                                />
-                            </div>
-                            <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
-                                {references.map((reference, index) => (
-                                    <Tooltip key={reference.id} title={reference.name}>
-                                        <div
-                                            className={canvasAppearance ? "relative size-12 shrink-0 overflow-hidden rounded-md border" : "relative size-12 shrink-0 overflow-hidden rounded-md border border-stone-200 bg-background dark:border-stone-700"}
-                                            style={canvasAppearance ? { background: canvasTheme.node.panel, borderColor: canvasTheme.node.stroke } : undefined}
-                                        >
-                                            <img src={reference.dataUrl || reference.url} alt={reference.name} className="size-full object-cover" />
-                                            <span className="absolute inset-x-0 bottom-0 truncate bg-black/60 px-1 py-0.5 text-center text-[9px] leading-none text-white">
-                                                {imageReferenceLabel(index)}
-                                            </span>
-                                        </div>
-                                    </Tooltip>
-                                ))}
-                            </div>
-                        </div>
-                    ) : null}
+                    <span className="inline-flex items-center gap-1.5 pb-2 text-xs" role="status" aria-live="polite" style={{ color: token.colorTextSecondary }}>
+                        {busy ? <LoaderCircle className="size-3.5 animate-spin" /> : result && !resultStale && !stale ? <Check className="size-3.5" /> : <span className="size-1.5 rounded-full" style={{ background: token.colorTextQuaternary }} />}
+                        {text(`status.${status}`)}
+                    </span>
                 </div>
 
-                <div className="grid gap-4 md:grid-cols-2">
-                    <div className="space-y-4">
-                        <label className="block">
-                            <span className="text-sm font-medium">{text("source")}</span>
-                            <span className={`ml-2 text-xs ${mutedTextClass}`} style={mutedTextStyle}>{text("sourceHint")}</span>
-                            <Input.TextArea
-                                className="mt-2"
-                                style={inputStyle}
-                                rows={8}
-                                value={sourcePrompt}
-                                disabled={disabled || optimizing}
-                                placeholder={text("sourcePlaceholder")}
-                                onChange={(event) => {
-                                    setSourcePrompt(event.target.value);
-                                    clearDraft();
-                                }}
-                            />
-                        </label>
-                        <label className="block">
-                            <span className="text-sm font-medium">{text("requirements")}</span>
-                            <span className={`ml-2 text-xs ${mutedTextClass}`} style={mutedTextStyle}>{text("requirementsHint")}</span>
-                            <Input.TextArea
-                                className="mt-2"
-                                style={inputStyle}
-                                rows={3}
-                                value={requirements}
-                                disabled={disabled || optimizing}
-                                placeholder={text(references.length ? "requirementsReferencePlaceholder" : "requirementsPlaceholder")}
-                                onChange={(event) => {
-                                    const value = event.target.value;
-                                    setRequirements(value);
-                                    setDraftStale(Boolean(draftComplete && draft.trim()));
-                                }}
-                            />
-                        </label>
-                    </div>
+                {!configReady ? <Alert type="warning" showIcon title={text("errors.modelUnavailable")} action={<Button size="small" type="text" onClick={() => openConfigDialog(false, "channels")}>{text("configure")}</Button>} /> : null}
+                {stale ? <Alert type="warning" showIcon title={text("sourceChanged")} action={<Button size="small" type="text" icon={<RefreshCw className="size-3.5" />} onClick={onRefresh}>{text("refresh")}</Button>} /> : null}
+                {error ? <Alert type="error" showIcon title={error} closable onClose={() => setError("")} /> : null}
+                {!sourceTokensValid ? <Alert type="warning" showIcon title={text("errors.tokensChanged")} /> : null}
 
-                    <div className="block">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span>
-                                <span className="text-sm font-medium">{text("result")}</span>
-                                <span className={`ml-2 text-xs ${mutedTextClass}`} style={mutedTextStyle}>{text("resultHint")}</span>
-                            </span>
-                            <span className="flex shrink-0 items-center gap-1">
-                                {canvasAppearance ? (
-                                    <span role="status" aria-live="polite" className="inline-flex items-center gap-1.5 px-1 text-xs" style={{ color: canvasTheme.node.muted }}>
-                                        <span className={`size-1.5 rounded-full ${resultStatus === "running" ? "animate-pulse" : ""}`} style={{ background: resultStatus === "ready" ? canvasTheme.node.text : canvasTheme.node.faint }} />
-                                        {text(`status.${resultStatus}`)}
-                                    </span>
-                                ) : (
-                                    <Tag role="status" aria-live="polite" className="m-0" color={resultStatus === "ready" ? "green" : resultStatus === "stale" ? "gold" : resultStatus === "running" ? "processing" : undefined}>
-                                        {text(`status.${resultStatus}`)}
-                                    </Tag>
-                                )}
-                                <Tooltip title={t("common.copy")}>
-                                    <span>
-                                        <Button
-                                            type="text"
-                                            size="small"
-                                            shape="circle"
-                                            icon={<Copy className="size-3.5" />}
-                                            disabled={optimizing || draftStale || !hasCompleteDraft}
-                                            aria-label={t("common.copy")}
-                                            onClick={() => copyText(draft.trim(), t("common.promptCopied"))}
-                                        />
-                                    </span>
-                                </Tooltip>
-                            </span>
+                <div className="grid gap-5 md:grid-cols-2">
+                    <div className="min-w-0 space-y-4">
+                        <div>
+                            <div className="mb-2 flex items-baseline gap-2"><span className="text-sm font-medium">{text("source")}</span><span className="text-xs" style={{ color: token.colorTextSecondary }}>{text("sourceHint")}</span></div>
+                            <PromptEditor label={text("source")} value={source} references={refs} onChange={setSource} readOnly={busy || stale} placeholder={text("sourcePlaceholder")} />
                         </div>
-                        <Input.TextArea
-                            className="mt-2"
-                            style={inputStyle}
-                            rows={15}
-                            value={draft}
-                            aria-label={text("result")}
-                            disabled={disabled}
-                            readOnly={optimizing}
-                            placeholder={optimizing ? text("optimizing") : text("resultPlaceholder")}
-                            onChange={(event) => {
-                                const value = event.target.value;
-                                setDraft(value);
-                                setDraftComplete(Boolean(value.trim()));
-                                setDraftStale(false);
-                            }}
-                        />
+                        <label className="block">
+                            <span className="mb-2 block text-sm font-medium">{text("requirements")} <span className="text-xs font-normal" style={{ color: token.colorTextSecondary }}>{text("optional")}</span></span>
+                            <Input.TextArea aria-label={text("requirements")} value={requirements} onChange={(event) => setRequirements(event.target.value)} disabled={busy || stale} autoSize={{ minRows: 2, maxRows: 4 }} placeholder={text(input.scenario === "image" ? "imageRequirements" : "videoRequirements")} />
+                        </label>
                     </div>
+                    <div className="flex min-w-0 flex-col">
+                        <div className="mb-2 flex min-h-5 items-center justify-between gap-2"><span className="text-sm font-medium">{text("result")}</span><Tooltip title={t("common.copy")}><Button type="text" size="small" className="!h-5 !p-0" aria-label={text("copyResult")} disabled={busy || !result?.text.trim()} icon={<Copy className="size-3.5" />} onClick={() => result && copyText(result.text)} /></Tooltip></div>
+                        <PromptEditor label={text("result")} value={draft} references={refs} readOnly={busy || !result} placeholder={busy ? text("streaming") : text("resultPlaceholder")} onChange={(value) => setResult((current) => current ? { ...current, text: value } : current)} tall />
+                        <div className="mt-2 min-h-5 text-xs leading-5" style={{ color: resultStale || !tokensValid && result ? token.colorWarningText : token.colorTextSecondary }}>
+                            {resultStale ? text("inputsChanged") : result && !tokensValid ? text("errors.tokensChanged") : text("resultHint")}
+                        </div>
+                    </div>
+                </div>
+
+                {input.references.length ? <div className="border-t pt-4" style={{ borderColor: token.colorBorderSecondary }}>
+                    <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0"><div className="flex items-center gap-1.5 text-sm font-medium"><ImageIcon className="size-3.5" />{text("analyzeReferences")}<span className="text-xs font-normal" style={{ color: token.colorTextSecondary }}>{input.references.length}</span></div><p className="mt-1 mb-0 text-xs leading-5" style={{ color: token.colorTextSecondary }}>{text(analyzeReferences ? "analysisOn" : "analysisOff")}</p></div>
+                        <Switch aria-label={text("analyzeReferences")} checked={analyzeReferences} disabled={busy || stale} onChange={setAnalyzeReferences} />
+                    </div>
+                    <div className="mt-3 flex gap-2.5 overflow-x-auto pb-1">{input.references.map((reference, index) => <Tooltip key={`${reference.id}-${index}`} title={reference.name}><div className="w-14 shrink-0"><img src={reference.dataUrl || reference.url} alt={reference.name} className="size-14 rounded-lg object-cover" /><div className="mt-1 truncate text-center text-[11px]" style={{ color: token.colorTextSecondary }}>{imageReferenceLabel(index)}</div></div></Tooltip>)}</div>
+                </div> : null}
+                {input.context.upstreamText || input.context.videoReferences?.length || input.context.audioReferences?.length ? <p className="m-0 text-xs leading-5" style={{ color: token.colorTextSecondary }}>{text("contextHint")}</p> : null}
+
+                <div className="flex flex-wrap items-center gap-2">
+                    {busy ? <Button type="text" danger icon={<Square className="size-3.5" />} onClick={stop}>{text("stop")}</Button> : <Button type="text" icon={<WandSparkles className="size-4" />} disabled={stale || !configReady || !sourceTokensValid || !source.trim()} onClick={() => void optimize()}>{text(result ? "retry" : "start")}</Button>}
+                    {result ? <Button type="text" icon={<ArrowRight className="size-3.5" />} disabled={!canContinue} onClick={() => void optimize(result.text)}>{text("continue")}</Button> : null}
                 </div>
             </div>
         </Modal>
     );
+}
+
+// Preserve canvas reference tokens as non-editable chips while keeping the surrounding prose editable.
+function PromptEditor({ value, onChange, references, label, placeholder, readOnly, tall = false }: {
+    value: string; onChange: (value: string) => void; references: NonNullable<PromptOptimizationInput["context"]["referenceTokens"]>;
+    label: string; placeholder: string; readOnly?: boolean; tall?: boolean;
+}) {
+    const { token } = theme.useToken();
+    const editorRef = useRef<HTMLDivElement>(null);
+    const lastEmitted = useRef<string | null>(null);
+    const composing = useRef(false);
+    const id = useId();
+    useEffect(() => {
+        const editor = editorRef.current;
+        if (!editor || document.activeElement === editor && value === lastEmitted.current) return;
+        editor.replaceChildren();
+        for (const part of value.split(/(@\[node:[^\]]+\])/g)) {
+            const reference = references.find((item) => item.token === part);
+            if (!reference) { editor.append(document.createTextNode(part)); continue; }
+            const chip = document.createElement("span");
+            chip.contentEditable = "false";
+            chip.dataset.promptToken = reference.token;
+            chip.textContent = `@${reference.label}`;
+            chip.title = reference.description || reference.label;
+            chip.className = "mx-0.5 inline-block rounded px-1.5 text-xs align-baseline";
+            Object.assign(chip.style, { background: token.colorFillSecondary, color: token.colorText });
+            editor.append(chip);
+        }
+    }, [value, references, token.colorFillSecondary, token.colorText]);
+    const emit = () => {
+        if (!editorRef.current) return;
+        lastEmitted.current = readEditor(editorRef.current);
+        onChange(lastEmitted.current);
+    };
+    const copySelection = (event: ClipboardEvent<HTMLDivElement>, cut = false) => {
+        const selection = window.getSelection();
+        if (!selection?.rangeCount || selection.isCollapsed) return;
+        const range = selection.getRangeAt(0);
+        if (!editorRef.current?.contains(range.commonAncestorContainer)) return;
+        event.preventDefault();
+        event.clipboardData.setData("text/plain", readEditor(range.cloneContents()));
+        if (cut && !readOnly) { range.deleteContents(); emit(); }
+    };
+    return <div className={`relative rounded-xl border ${tall ? "flex-1" : ""}`} style={{ borderColor: token.colorBorder, background: token.colorFillQuaternary }}>
+        {!value ? <span id={`${id}-placeholder`} className="pointer-events-none absolute top-3 left-3 right-3 text-sm leading-7" style={{ color: token.colorTextPlaceholder }}>{placeholder}</span> : null}
+        <div ref={editorRef} role="textbox" aria-label={label} aria-multiline="true" aria-readonly={Boolean(readOnly)} contentEditable={!readOnly} suppressContentEditableWarning
+            className={`thin-scrollbar max-h-80 overflow-y-auto whitespace-pre-wrap break-words p-3 text-sm leading-7 outline-none focus-visible:ring-1 ${tall ? "min-h-60 md:min-h-80" : "min-h-48"}`} style={{ color: token.colorText, borderRadius: "inherit" }}
+            onInput={() => { if (!composing.current) emit(); }} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; emit(); }}
+            onCopy={copySelection} onCut={(event) => copySelection(event, true)}
+            onPaste={(event) => {
+                event.preventDefault();
+                if (readOnly) return;
+                const selection = window.getSelection();
+                if (!selection?.rangeCount) return;
+                const range = selection.getRangeAt(0);
+                if (!editorRef.current?.contains(range.commonAncestorContainer)) return;
+                range.deleteContents();
+                const node = document.createTextNode(event.clipboardData.getData("text/plain"));
+                range.insertNode(node); range.setStartAfter(node); range.collapse(true);
+                selection.removeAllRanges(); selection.addRange(range); emit();
+            }} />
+    </div>;
+}
+
+function readEditor(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent || "";
+    if (node instanceof HTMLElement && node.dataset.promptToken) return node.dataset.promptToken;
+    if (node.nodeName === "BR") return "\n";
+    // Browsers use a lone BR as the caret placeholder inside an empty line.
+    if (node instanceof HTMLElement && node.childNodes.length === 1 && node.firstChild?.nodeName === "BR") return "";
+    return Array.from(node.childNodes, (child, index) => `${index && child.nodeName === "DIV" ? "\n" : ""}${readEditor(child)}`).join("");
 }

@@ -18,8 +18,11 @@ export type CanvasResourceReference = {
     active: boolean;
 };
 
-export function buildNodeMentionReferences(node: CanvasNodeData, nodes: CanvasNodeData[], connections: CanvasConnection[]) {
-    return labelResourceNodes(getMentionResourceNodes(node.id, nodes, connections), true);
+export function buildNodeMentionReferences(node: CanvasNodeData, nodes: CanvasNodeData[], connections: CanvasConnection[], includeSourceImage?: boolean) {
+    if (node.type !== CanvasNodeType.Image || includeSourceImage === undefined) return labelResourceNodes(getMentionResourceNodes(node.id, nodes, connections), true);
+    const inputs = expandGroupResourceNodes(getGenerationResourceNodes(node.id, nodes, connections), nodes);
+    const resources = includeSourceImage && node.metadata?.content ? [node, ...inputs] : inputs;
+    return labelResourceNodes([...new Map(resources.map((resource) => [resource.id, resource])).values()], true);
 }
 
 export function buildCanvasResourceReferences(nodes: CanvasNodeData[]) {
