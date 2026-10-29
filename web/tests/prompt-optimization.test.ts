@@ -12,13 +12,26 @@ const dependencies = await (async () => {
         if (!originalStorage) Reflect.deleteProperty(globalThis, "localStorage");
     }
 })();
-const [{ buildPromptOptimizationContext, samePromptOptimizationInput, promptOptimizationTokens }, { requestPromptOptimization }, { defaultConfig }, { default: i18n }] = dependencies;
+const [{ buildPromptOptimizationContext, samePromptOptimizationInput, promptOptimizationTokens, appendPromptOptimizationRequirement }, { requestPromptOptimization }, { defaultConfig }, { default: i18n }] = dependencies;
 
-function config(script?: string): AiConfig {
+test.each([
+    ["", " 保留文字 ", "保留文字"],
+    ["已有要求", "保留文字", "已有要求\n保留文字"],
+    ["  已有要求  ", " ", "  已有要求  "],
+    ["  保留文字  ", "保留文字", "  保留文字  "],
+    ["已有要求\n保留文字\n固定镜头", "保留文字", "已有要求\n保留文字\n固定镜头"],
+    ["保留文字颜色", "保留文字", "保留文字颜色\n保留文字"],
+    ["原要求\n第一行\n第二行\n结尾", "第一行\n第二行", "原要求\n第一行\n第二行\n结尾"],
+    ["仅修改背景", "保留引号“晴山”\n净含量：250 g", "仅修改背景\n保留引号“晴山”\n净含量：250 g"],
+])("saved requirements append without overwriting or duplicating complete blocks: %s", (current, addition, expected) => {
+    expect(appendPromptOptimizationRequirement(current, addition)).toBe(expected);
+});
+
+function config(script?: string, model = "text-model"): AiConfig {
     return {
         ...defaultConfig,
-        textModel: "optimizer::text-model",
-        channels: [{ id: "optimizer", name: "Optimizer", baseUrl: "https://optimizer.example", apiKey: "test-only", apiFormat: "openai", models: [{ name: "text-model", capability: "text", script }] }],
+        textModel: `optimizer::${model}`,
+        channels: [{ id: "optimizer", name: "Optimizer", baseUrl: "https://optimizer.example", apiKey: "test-only", apiFormat: "openai", models: [{ name: model, capability: "text", script }] }],
     };
 }
 
@@ -27,6 +40,78 @@ function input(): PromptOptimizationInput & { requirements: string; analyzeRefer
 }
 
 const captureUserInput = 'return JSON.stringify({ model, baseUrl, apiKey, messages: messages.filter(message => message.role === "user"), separatesContext: systemPrompt.includes("do not copy it") });';
+const completedResponse = (text: string) => new Response(`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output_text: text } })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+
+// These mocks verify transport and instruction contracts, not the quality or length of model rewrites.
+test.each(["image", "video"] as const)("native and scripted %s optimization share scenario instructions without rewriting the source locally", async (scenario) => {
+    const sources = [
+        { prompt: "小猫", requirements: "" },
+        { prompt: '一只小猫，侧面近景，柔和侧光，背景保持纯白。\n画面文字：\n“晴山”\n净含量：250 g', requirements: "保留现有构图、文字和换行" },
+        { prompt: "小猫。不要扩写，只调整标点。", requirements: "" },
+        { prompt: "小猫", requirements: "不扩写，保持原文" },
+    ];
+    const script = 'onDelta(JSON.stringify({ systemPrompt, messages })); return JSON.parse(messages.find(message => message.role === "user").content[0].text).sourcePrompt;';
+    let nativeBody: { model: string; input: Array<{ role: string; content: string | Array<{ type: string; text: string }> }> };
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation(async (_url, options) => {
+        nativeBody = JSON.parse(String(options?.body));
+        const content = nativeBody.input.find((message) => message.role === "user")!.content as Array<{ type: string; text: string }>;
+        return completedResponse(JSON.parse(content[0].text).sourcePrompt);
+    });
+    try {
+        for (const source of sources) {
+            const request = { ...input(), ...source, scenario, context: {} };
+            const native = config(undefined, "gpt-6.1-sol");
+            expect(await requestPromptOptimization(native, native.textModel, request, () => {})).toBe(source.prompt);
+            let captured: { systemPrompt: string; messages: Array<{ role: string; content: string | Array<{ type: string; text: string }> }> } | undefined;
+            const scripted = config(script, "gpt-6.1-sol");
+            expect(await requestPromptOptimization(scripted, scripted.textModel, request, (value) => { captured = JSON.parse(value); })).toBe(source.prompt);
+            const nativeUser = nativeBody!.input.find((message) => message.role === "user")!.content as Array<{ type: string; text: string }>;
+            const scriptUser = captured!.messages.find((message) => message.role === "user")!.content as Array<{ type: string; text: string }>;
+            expect(nativeBody!.model).toBe("gpt-6.1-sol");
+            expect(nativeBody!.input.find((message) => message.role === "system")?.content).toBe(captured!.systemPrompt);
+            expect(captured!.messages.find((message) => message.role === "system")?.content).toBe(captured!.systemPrompt);
+            expect(nativeUser).toEqual(scriptUser.map((part) => ({ ...part, type: "input_text" })));
+            expect(JSON.parse(nativeUser[0].text)).toMatchObject({ scenario, sourcePrompt: source.prompt, generationContext: {} });
+            expect(JSON.parse(nativeUser[0].text).additionalRequirements).toBe(source.requirements || undefined);
+            expect(captured!.systemPrompt).toContain(scenario === "image" ? "For images," : "For video,");
+            expect(captured!.systemPrompt).not.toContain(scenario === "image" ? "For video," : "For images,");
+            expect(captured!.systemPrompt).toContain("not from its length alone");
+            expect(captured!.systemPrompt).toContain("no expansion take precedence");
+            expect(native.systemPrompt).toBe(defaultConfig.systemPrompt);
+            expect(scripted.channels[0].models[0].script).toBe(script);
+        }
+        expect(fetchMock).toHaveBeenCalledTimes(sources.length);
+    } finally { fetchMock.mockRestore(); }
+});
+
+test.each(["auto", "low", "medium", "high", "xhigh"] as const)("optimizer preserves explicit gpt-6.1-sol reasoning selection %s without adding other parameters", async (reasoningEffort) => {
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation(async () => completedResponse("仅用于请求合同校验"));
+    try {
+        const initial = { ...config(undefined, "gpt-6.1-sol"), reasoningEffort };
+        await requestPromptOptimization(initial, initial.textModel, { ...input(), prompt: "小猫", requirements: "", context: {} }, () => {});
+        const [url, options] = fetchMock.mock.calls[0];
+        const body = JSON.parse(String(options?.body));
+        expect(String(url)).toBe("https://optimizer.example/v1/responses");
+        expect(body).toMatchObject({ model: "gpt-6.1-sol", stream: true, store: false });
+        expect(Object.keys(body).sort()).toEqual(["input", "model", "store", "stream", ...(reasoningEffort === "auto" ? [] : ["reasoning"])].sort());
+        if (reasoningEffort === "auto") expect(body).not.toHaveProperty("reasoning");
+        else expect(body.reasoning).toEqual({ effort: reasoningEffort });
+        expect(initial.reasoningEffort).toBe(reasoningEffort);
+    } finally { fetchMock.mockRestore(); }
+});
+
+test("native completed results preserve artwork text and still enforce first-occurrence token order", async () => {
+    const body = '主体 @[node:subject] 对照 @[node:style]\n包装正面仅写：\n“晴山”\n净含量：250 g';
+    let responseText = body;
+    const fetchMock = spyOn(globalThis, "fetch").mockImplementation(async () => completedResponse(responseText));
+    try {
+        const initial = config(undefined, "gpt-6.1-sol");
+        const request = { ...input(), prompt: body };
+        expect(await requestPromptOptimization(initial, initial.textModel, request, () => {})).toBe(body);
+        responseText = body.replace("主体 @[node:subject] 对照 @[node:style]", "主体 @[node:style] 对照 @[node:subject]");
+        await expect(requestPromptOptimization(initial, initial.textModel, request, () => {})).rejects.toThrow(i18n.t("promptOptimization.errors.tokensChanged"));
+    } finally { fetchMock.mockRestore(); }
+});
 
 test("optimization uses the selected text channel and separates read-only upstream context", async () => {
     const original = config(captureUserInput);

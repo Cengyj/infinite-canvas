@@ -48,7 +48,7 @@ export function buildPromptOptimizationContext(scenario: PromptOptimizationScena
         imageRoles: references.map((image) => image.id === options?.sourceImageId ? "source-image" : "reference-image"),
         frameSize: transport === "gemini" ? imageConfig?.aspectRatio : config.size,
         resolution: imageConfig?.imageSize,
-        quality: config.quality,
+        quality: transport === "gemini" ? undefined : config.quality,
         transparentBackground: config.background === "transparent",
     };
     const video = resolveVideoGenerationConfig({ ...config, model: id }, { imageCount: references.length, videoCount: options?.videoReferences?.length, audioCount: options?.audioReferences?.length });
@@ -95,4 +95,10 @@ function contextValues(context: PromptOptimizationContext) {
 export function promptOptimizationTokens(prompt: string) {
     // Composer reference numbers follow the first appearance of each token.
     return [...new Set(prompt.match(/@\[node:[^\]]*\]/g) || [])];
+}
+
+export function appendPromptOptimizationRequirement(current: string, addition: string) {
+    const requirement = addition.trim();
+    if (!requirement || `\n${current.trim()}\n`.includes(`\n${requirement}\n`)) return current;
+    return current.trim() ? `${current.trimEnd()}\n${requirement}` : requirement;
 }

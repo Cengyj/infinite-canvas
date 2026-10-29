@@ -22,7 +22,21 @@ export default {
         analyzeReferences: "Analyze reference images", analysisOn: "Read the reference images in order to understand subject, composition, and style.", analysisOff: "Using text and reference descriptions. Enable to share the images with the text model.",
         contextHint: "Includes generation settings and upstream text. Video and audio references are described only.", configure: "Configure providers",
         emptySource: "Enter a prompt to optimize first", sourceChanged: "The source prompt, references, or generation settings changed. Reload them before optimizing.", refresh: "Reload source", inputsChanged: "Optimization inputs changed. Optimize again before applying.", failed: "Prompt optimization failed. Please try again.",
-        status: { waiting: "Ready to start", running: "Optimizing", ready: "Result ready", outdated: "Needs updating" },
+        status: { waiting: "Ready to start", running: "Optimizing", ready: "Result ready", outdated: "Needs updating", invalid: "Result cannot be applied" },
+        emptyResult: "The result is empty. Add prompt text or optimize again before applying.",
+        savedRequirements: {
+            title: "Saved requirements", hint: "Selecting appends to your current requirements for editing. Only Save stores them.", suggested: "Quick choices", imageSaved: "Saved · Image", videoSaved: "Saved · Video",
+            empty: "No saved requirements. Enter your requirements, then save them for reuse.", saveCurrent: "Save current requirements", saved: "Requirements saved", removed: "Saved requirements removed", remove: "Remove saved requirements: {{value}}",
+            loading: "Loading…", loadFailed: "Could not update local saved requirements. Please reload them.", reload: "Reload", saveFailed: "Could not save. Your current input is preserved; please retry.", removeFailed: "Could not remove. Your saved requirements are preserved; please retry.",
+            presets: {
+                concise: { label: "Shorten without expanding", value: "Only shorten the original text, preserving its intent and language and removing repetition or vague wording. Do not expand or add visual details, actions, subjects, styles or story events absent from the original." },
+                wording: { label: "Preserve visible text verbatim", value: "Preserve existing visible text, numbers, punctuation and line breaks verbatim. Do not translate or paraphrase them." },
+                identity: { label: "Preserve identity and unchanged content", value: "Preserve existing subject identities, counts, appearances and all content not requested to change. Clarify only the explicitly requested edits." },
+                composition: { label: "Clarify composition and spatial relations", value: "Clarify only existing spatial relations, composition and viewpoint. Do not add scenery, props, lighting or styles." },
+                continuity: { label: "Clarify action continuity", value: "Keep subjects, counts, movement directions and spatial relations continuous. Clarify only the start, progression and end of existing actions." },
+                pacing: { label: "Fit duration and avoid additions", value: "Simplify actions to fit the current duration. Do not add cuts, dialogue, narration, music or sound effects." },
+            },
+        },
         errors: { modelUnavailable: "Select an available text model and configure its provider", tokensChanged: "The result changed canvas references. Please optimize again" },
     },
     meta: {

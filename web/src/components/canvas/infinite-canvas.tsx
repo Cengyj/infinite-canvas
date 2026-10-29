@@ -48,19 +48,19 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
     );
 
     useEffect(() => {
+        const ignoresShortcuts = (target: EventTarget | null) => target instanceof Element
+            && Boolean(target.closest("input,textarea,select,[contenteditable='true'],[data-canvas-no-zoom],[data-canvas-shortcuts-ignore],[role='dialog'],[role='alertdialog']"));
         const handleKeyDown = (event: KeyboardEvent) => {
+            if (ignoresShortcuts(event.target)) return;
             if (event.key === "Control") setIsControlPressed(true);
             if (event.code !== "Space") return;
-            const target = event.target instanceof Element ? event.target : null;
-            if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement || target?.closest("[contenteditable='true']")) return;
             event.preventDefault();
             setIsSpacePressed(true);
         };
 
         const handleKeyUp = (event: KeyboardEvent) => {
             if (event.code === "Space") {
-                const target = event.target instanceof Element ? event.target : null;
-                if (!(event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement || target?.closest("[contenteditable='true']"))) event.preventDefault();
+                if (!ignoresShortcuts(event.target)) event.preventDefault();
                 setIsSpacePressed(false);
             }
             if (event.key === "Control") setIsControlPressed(false);

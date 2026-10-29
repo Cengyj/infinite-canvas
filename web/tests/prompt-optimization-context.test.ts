@@ -65,6 +65,45 @@ test.each([
     }
 });
 
+test("native Gemini image context excludes quality that generation does not submit", async () => {
+    const initial: AiConfig = { ...config("gemini"), size: "1024x1024", quality: "max", background: "transparent", count: "1", channels: [{ ...config("gemini").channels[0], models: [{ name: "generator", capability: "image" }] }] };
+    let submitted: { generationConfig?: Record<string, unknown> } | undefined;
+    const post = spyOn(axios, "post").mockImplementation(async (_url, data) => {
+        submitted = data;
+        return { data: { candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: "dGVzdA==" } }] } }] } } as never;
+    });
+    try {
+        const context = buildPromptOptimizationContext("image", initial, []);
+        await requestGeneration(initial, "商品海报");
+        expect(submitted?.generationConfig).toMatchObject({ responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: context.frameSize, imageSize: context.resolution } });
+        expect(submitted?.generationConfig).not.toHaveProperty("quality");
+        expect(context.quality).toBeUndefined();
+        expect(JSON.parse(JSON.stringify(context))).not.toHaveProperty("quality");
+        expect(context.transparentBackground).toBe(true);
+    } finally {
+        post.mockRestore();
+    }
+});
+
+test("image snapshots ignore only native Gemini quality while tracking effective image config", () => {
+    const read = (value: AiConfig): PromptOptimizationInput => ({ targetId: "image-workbench", scenario: "image", prompt: "商品海报", references: [], context: buildPromptOptimizationContext("image", value, []), generationIdentity: buildPromptOptimizationGenerationIdentity("image", value) });
+    const initial = { ...config("gemini"), quality: "low", size: "1024x1024" };
+    const original = read(initial);
+    expect(samePromptOptimizationInput(original, read({ ...initial, quality: "max" }))).toBe(true);
+    for (const size of ["1024x1536", "2048x2048"]) {
+        const changed = read({ ...initial, size });
+        expect(changed.context).not.toEqual(original.context);
+        expect(samePromptOptimizationInput(original, changed)).toBe(false);
+    }
+    for (const transport of [config(), config("openai", "return params;"), config("gemini", "return params;")]) {
+        const low = read({ ...transport, quality: "low" });
+        const high = read({ ...transport, quality: "max" });
+        expect(low.context.quality).toBe("low");
+        expect(high.context.quality).toBe("max");
+        expect(samePromptOptimizationInput(low, high)).toBe(false);
+    }
+});
+
 test("unfinished Gemini sizes do not crash optimization snapshot reads", () => {
     for (const size of ["invalid", "0x2000", "9:"]) {
         const context = buildPromptOptimizationContext("image", { ...config("gemini"), size }, []);

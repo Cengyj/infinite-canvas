@@ -4,6 +4,7 @@ import { ArrowRight, Check, Copy, Image as ImageIcon, LoaderCircle, RefreshCw, S
 import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
+import { PromptRequirementPicker } from "@/components/prompt-requirement-picker";
 import { useCopyText } from "@/hooks/use-copy-text";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
 import { promptOptimizationTokens, type PromptOptimizationInput } from "@/lib/prompt-optimization";
@@ -17,6 +18,8 @@ type Props = {
     onApply: (value: string) => void;
     onClose: () => void;
 };
+
+const EMPTY_REFERENCE_TOKENS: NonNullable<PromptOptimizationInput["context"]["referenceTokens"]> = [];
 
 export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose }: Props) {
     const { t } = useTranslation();
@@ -32,7 +35,7 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
     const [source, setSource] = useState(input.prompt);
     const [requirements, setRequirements] = useState("");
     const [analyzeReferences, setAnalyzeReferences] = useState(false);
-    const [result, setResult] = useState<{ text: string; signature: string } | null>(null);
+    const [result, setResult] = useState<{ text: string; source: string; signature: string } | null>(null);
     const [preview, setPreview] = useState<string | null>(null);
     const [error, setError] = useState("");
     const controllerRef = useRef<AbortController | null>(null);
@@ -49,7 +52,7 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
     const sourceTokensValid = JSON.stringify(promptOptimizationTokens(source)) === originalTokens;
     const tokensValid = JSON.stringify(promptOptimizationTokens(draft)) === originalTokens;
     const resultStale = Boolean(result && result.signature !== signature);
-    const canContinue = Boolean(result?.text.trim() && !busy && !stale && configReady && sourceTokensValid && tokensValid);
+    const canContinue = Boolean(result?.text.trim() && result.source === source && !busy && !stale && configReady && sourceTokensValid && tokensValid);
     const canApply = canContinue && !resultStale;
     const text = (key: string) => t(`promptOptimization.${key}`);
 
@@ -88,7 +91,7 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
                 if (isActive()) setPreview(value);
             }, controller.signal);
             if (!isActive()) return;
-            setResult({ text: value, signature: requestSignature });
+            setResult({ text: value, source: nextSource, signature: requestSignature });
             previousSource.current = null;
         } catch (cause) {
             if (isActive()) {
@@ -105,8 +108,8 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
     };
 
     const close = () => { stop(); onClose(); };
-    const status = busy ? "running" : stale || resultStale ? "outdated" : result ? "ready" : "waiting";
-    const refs = input.context.referenceTokens || [];
+    const status = busy ? "running" : stale || resultStale ? "outdated" : canApply ? "ready" : result ? "invalid" : "waiting";
+    const refs = input.context.referenceTokens || EMPTY_REFERENCE_TOKENS;
 
     return (
         <Modal open centered width={960} zIndex={1000} onCancel={close} mask={{ closable: !busy }}
@@ -115,13 +118,11 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
             title={<div className="flex items-center gap-2.5"><WandSparkles className="size-4" /><span>{text("title")}</span><span className="ml-1 text-xs font-normal" style={{ color: token.colorTextSecondary }}>{text(input.scenario === "image" ? "image" : "video")}</span></div>}
             footer={<div className="space-y-2.5">
                 <p className="m-0 text-left text-xs" style={{ color: token.colorTextSecondary }}>{text("applyHint")}</p>
-                <div className="thin-scrollbar flex items-center justify-between gap-3 overflow-x-auto">
-                    <div className="flex shrink-0 items-center gap-1.5">
-                        {busy ? <Button type="text" danger icon={<Square className="size-3.5" />} onClick={stop}>{text("stop")}</Button> : <Button type="text" icon={<WandSparkles className="size-4" />} disabled={stale || !configReady || !sourceTokensValid || !source.trim()} onClick={() => void optimize()}>{text(result ? "retry" : "start")}</Button>}
-                        {result ? <Button type="text" icon={<ArrowRight className="size-3.5" />} disabled={!canContinue} onClick={() => void optimize(result.text)}>{text("continue")}</Button> : null}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1.5">
+                <div className="thin-scrollbar flex items-center overflow-x-auto">
+                    <div className="ml-auto flex shrink-0 items-center gap-1.5">
                         <Button type="text" onClick={close}>{t("common.cancel")}</Button>
+                        {busy ? <Button type="text" danger icon={<Square className="size-3.5" />} onClick={stop}>{text("stop")}</Button> : <Button type="text" icon={<WandSparkles className="size-4" />} disabled={stale || !configReady || !sourceTokensValid || !source.trim()} onClick={() => void optimize()}>{text(result ? "retry" : "start")}</Button>}
+                        {result ? <Button type="text" icon={<ArrowRight className="size-3.5" />} disabled={!canContinue} onClick={() => { if (canContinue) void optimize(result.text); }}>{text("continue")}</Button> : null}
                         <Button type="primary" icon={<Check className="size-4" />} disabled={!canApply} onClick={() => canApply && result && onApply(result.text.trim())}>{text("apply")}</Button>
                     </div>
                 </div>
@@ -134,7 +135,7 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
                         <ModelPicker config={config} value={textModel} capability="text" fullWidth disabled={busy} className="!h-9 !rounded-lg !shadow-none" onChange={(value) => updateConfig("textModel", value)} onMissingConfig={() => openConfigDialog(false, "channels")} />
                     </div>
                     <span className="inline-flex items-center gap-1.5 pb-2 text-xs" role="status" aria-live="polite" style={{ color: token.colorTextSecondary }}>
-                        {busy ? <LoaderCircle className="size-3.5 animate-spin" /> : result && !resultStale && !stale ? <Check className="size-3.5" /> : <span className="size-1.5 rounded-full" style={{ background: token.colorTextQuaternary }} />}
+                        {busy ? <LoaderCircle className="size-3.5 animate-spin" /> : status === "ready" ? <Check className="size-3.5" /> : <span className="size-1.5 rounded-full" style={{ background: token.colorTextQuaternary }} />}
                         {text(`status.${status}`)}
                     </span>
                 </div>
@@ -150,16 +151,19 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
                             <div className="mb-2 flex items-baseline gap-2"><span className="text-sm font-medium">{text("source")}</span><span className="text-xs" style={{ color: token.colorTextSecondary }}>{text("sourceHint")}</span></div>
                             <PromptEditor label={text("source")} value={source} references={refs} onChange={setSource} readOnly={busy || stale} placeholder={text("sourcePlaceholder")} />
                         </div>
-                        <label className="block">
-                            <span className="mb-2 block text-sm font-medium">{text("requirements")} <span className="text-xs font-normal" style={{ color: token.colorTextSecondary }}>{text("optional")}</span></span>
+                        <div>
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                                <span className="text-sm font-medium">{text("requirements")} <span className="text-xs font-normal" style={{ color: token.colorTextSecondary }}>{text("optional")}</span></span>
+                                <PromptRequirementPicker scenario={input.scenario} value={requirements} onChange={setRequirements} disabled={busy || stale} />
+                            </div>
                             <Input.TextArea aria-label={text("requirements")} value={requirements} onChange={(event) => setRequirements(event.target.value)} disabled={busy || stale} autoSize={{ minRows: 2, maxRows: 4 }} placeholder={text(input.scenario === "image" ? "imageRequirements" : "videoRequirements")} />
-                        </label>
+                        </div>
                     </div>
                     <div className="flex min-w-0 flex-col">
                         <div className="mb-2 flex min-h-5 items-center justify-between gap-2"><span className="text-sm font-medium">{text("result")}</span><Tooltip title={t("common.copy")}><Button type="text" size="small" className="!h-5 !p-0" aria-label={text("copyResult")} disabled={busy || !result?.text.trim()} icon={<Copy className="size-3.5" />} onClick={() => result && copyText(result.text)} /></Tooltip></div>
                         <PromptEditor label={text("result")} value={draft} references={refs} readOnly={busy || !result} placeholder={busy ? text("streaming") : text("resultPlaceholder")} onChange={(value) => setResult((current) => current ? { ...current, text: value } : current)} tall />
                         <div className="mt-2 min-h-5 text-xs leading-5" style={{ color: resultStale || !tokensValid && result ? token.colorWarningText : token.colorTextSecondary }}>
-                            {resultStale ? text("inputsChanged") : result && !tokensValid ? text("errors.tokensChanged") : text("resultHint")}
+                            {resultStale ? text("inputsChanged") : result && !draft.trim() && !busy ? text("emptyResult") : result && !tokensValid ? text("errors.tokensChanged") : text("resultHint")}
                         </div>
                     </div>
                 </div>

@@ -14,7 +14,7 @@ export function buildCanvasPromptOptimizationInput(projectId: string, nodeId: st
     const references = [...new Map([...ownImages, ...generation.referenceImages].map((image) => [image.id, image])).values()];
     const generationConfig = buildGenerationConfig(config, node, mode);
     const context = buildPromptOptimizationContext(mode, generationConfig, references, {
-        sourceImageId: ownImages[0]?.id,
+        sourceImageId: node.type === CanvasNodeType.Image && references.some((image) => image.id === node.id) ? node.id : undefined,
         videoReferences: generation.referenceVideos.map((video) => video.name),
         audioReferences: generation.referenceAudios.map((audio) => audio.name),
     });

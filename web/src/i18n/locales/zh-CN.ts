@@ -22,7 +22,21 @@ export default {
         analyzeReferences: "结合参考图分析", analysisOn: "将按顺序读取参考图，辅助理解主体、构图与风格。", analysisOff: "当前只使用文字与引用说明；开启后会将参考图交给文本模型。",
         contextHint: "已带入当前生成参数和上游文字；视频、音频仅提供引用说明。", configure: "配置渠道",
         emptySource: "请先输入需要优化的提示词", sourceChanged: "原提示词、引用或生成设置已变化，请重新读取后优化。", refresh: "重新读取", inputsChanged: "优化条件已变化，请重新优化后应用。", failed: "提示词优化失败，请重试。",
-        status: { waiting: "等待优化", running: "正在优化", ready: "结果已就绪", outdated: "需要重新优化" },
+        status: { waiting: "等待优化", running: "正在优化", ready: "结果已就绪", outdated: "需要重新优化", invalid: "结果暂不可应用" },
+        emptyResult: "结果为空，请补充正文或重新优化后再应用。",
+        savedRequirements: {
+            title: "常用要求", hint: "选择后追加到当前补充要求，可继续编辑；只在点击收藏时保存。", suggested: "快捷选择", imageSaved: "已收藏 · 图片", videoSaved: "已收藏 · 视频",
+            empty: "尚未收藏要求。可先在输入框填写，再收藏复用。", saveCurrent: "收藏当前要求", saved: "已收藏当前要求", removed: "已删除常用要求", remove: "删除常用要求：{{value}}",
+            loading: "正在读取…", loadFailed: "无法更新本地常用要求，请重新读取。", reload: "重新读取", saveFailed: "收藏失败，当前输入仍保留，请重试。", removeFailed: "删除失败，已收藏内容仍保留，请重试。",
+            presets: {
+                concise: { label: "精简表达，不扩写", value: "仅精简原文，保持原意和原有语言，删除重复、空泛表达。不扩写，不补充原文未表达的视觉细节、动作、主体、风格或情节。" },
+                wording: { label: "逐字保留画面文字", value: "逐字保留画面中已有的文字、数字、标点和换行，不翻译或改写。" },
+                identity: { label: "保留主体与未修改内容", value: "保留已有主体的身份、数量、外观及未要求改变的内容，只澄清当前明确提出的修改。" },
+                composition: { label: "澄清构图与空间关系", value: "仅澄清已有的空间关系、构图和视角，不新增场景、道具、光线或风格。" },
+                continuity: { label: "梳理动作连续性", value: "保持主体、数量、运动方向和空间关系连续，只梳理已有动作的起始、发展与结束。" },
+                pacing: { label: "匹配时长，减少额外内容", value: "按当前时长精简动作，不新增镜头切换、对白、旁白、音乐或音效。" },
+            },
+        },
         errors: { modelUnavailable: "请选择有效的文本模型并配置渠道", tokensChanged: "优化结果改变了画布引用，请重新优化" },
     },
     meta: {

@@ -30,9 +30,10 @@ test("image optimization follows new-node and overwrite reference semantics with
     expect(initial.references.map((item) => item.id)).toEqual([source.id, image.id]);
     expect(initial.prompt).toBe("改成暖光");
     expect(initial.context.upstreamText).toContain("保留包装文字");
-    expect(initial.context).toMatchObject({ quality: "max", frameSize: "1024x1536" });
+    expect(initial.context).toMatchObject({ quality: "max", frameSize: "1024x1536", imageIntent: "edit", imageRoles: ["source-image", "reference-image"] });
     const overwritten = buildCanvasPromptOptimizationInput("project", source.id, "image", initial.prompt, nodes, edges, { ...defaultConfig, nodeRegenerateBehavior: "overwrite" })!;
     expect(overwritten.references.map((item) => item.id)).toEqual([image.id]);
+    expect(overwritten.context).toMatchObject({ imageIntent: "reference", imageRoles: ["reference-image"] });
 });
 
 test.each(["new-node", "overwrite"] as const)("image mention labels follow the actual %s reference order", (behavior) => {
@@ -58,6 +59,7 @@ test.each(["new-node", "overwrite"] as const)("image mentions without external i
     const input = buildCanvasPromptOptimizationInput("project", source.id, "image", "改成暖光", [source], [], { ...defaultConfig, nodeRegenerateBehavior: behavior })!;
     expect(mentions.map((item) => item.nodeId)).toEqual(behavior === "new-node" ? [source.id] : []);
     expect(mentions.map((item) => item.nodeId)).toEqual(input.references.map((item) => item.id));
+    expect(input.context).toMatchObject(behavior === "new-node" ? { imageIntent: "edit", imageRoles: ["source-image"] } : { imageIntent: "create", imageRoles: [] });
     expect(buildNodeMentionReferences(node("empty", CanvasNodeType.Image), [], [], behavior !== "overwrite")).toEqual([]);
 });
 
@@ -81,7 +83,7 @@ test.each(["new-node", "overwrite"] as const)("image mentions preserve group ded
     }
 });
 
-test("an explicit group source reference keeps its generation position when not automatically prepended", () => {
+test.each(["new-node", "overwrite"] as const)("an explicit group source reference keeps its source role and generation position in %s mode", (behavior) => {
     const group = node("group", CanvasNodeType.Group);
     const image = node("reference", CanvasNodeType.Image, { content: "blob:reference", groupId: group.id });
     const source = node("source", CanvasNodeType.Image, { content: "blob:source", groupId: group.id });
@@ -90,6 +92,10 @@ test("an explicit group source reference keeps its generation position when not 
     expect(buildNodeGenerationContext(source.id, nodes, edges, "").referenceImages.map((item) => item.id)).toEqual([image.id, source.id]);
     expect(buildNodeMentionReferences(source, nodes, edges, false).map((item) => item.nodeId)).toEqual([image.id, source.id]);
     expect(buildNodeMentionReferences(source, nodes, edges, true).map((item) => item.nodeId)).toEqual([source.id, image.id]);
+    const input = buildCanvasPromptOptimizationInput("project", source.id, "image", "改成暖光", nodes, edges, { ...defaultConfig, nodeRegenerateBehavior: behavior })!;
+    expect(input.references.map((item) => item.id)).toEqual(behavior === "new-node" ? [source.id, image.id] : [image.id, source.id]);
+    expect(input.context).toMatchObject({ imageIntent: "edit", imageRoles: behavior === "new-node" ? ["source-image", "reference-image"] : ["reference-image", "source-image"] });
+    expect(input.prompt).toBe("改成暖光");
 });
 
 test("config optimization preserves group tokens and the generation resource order", () => {
