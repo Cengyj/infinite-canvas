@@ -4,8 +4,10 @@ import { Button, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
-import { defaultConfig, resolveModelForCapability, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import type { VideoGenerationMedia } from "@/lib/video-generation-config";
+import { useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { canvasThemes } from "@/lib/canvas-theme";
+import { buildGenerationConfig } from "@/lib/canvas/canvas-generation-helpers";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { CanvasImageSettingsPopover } from "./canvas-image-settings-popover";
 import { CanvasPromptLibrary } from "./canvas-prompt-library";
@@ -23,6 +25,7 @@ export type CanvasNodeGenerationMode = CanvasGenerationMode;
 
 type CanvasNodePromptPanelProps = {
     node: CanvasNodeData;
+    videoMedia?: VideoGenerationMedia;
     isRunning: boolean;
     onPromptChange: (nodeId: string, prompt: string) => void;
     onConfigChange: (nodeId: string, patch: Partial<CanvasNodeData["metadata"]>) => void;
@@ -38,13 +41,13 @@ type CanvasNodePromptPanelProps = {
     getOptimizationInput?: (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => PromptOptimizationInput | null;
 };
 
-export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, onConfigChange, onGenerate, onStop, mentionReferences = [], connectedNodes = [], onDisconnectReference, onStartReferenceSelection, onImageSettingsOpenChange, modeOverride, getOptimizationInput }: CanvasNodePromptPanelProps) {
+export function CanvasNodePromptPanel({ node, nodes, videoMedia, isRunning, onPromptChange, onConfigChange, onGenerate, onStop, mentionReferences = [], connectedNodes = [], onDisconnectReference, onStartReferenceSelection, onImageSettingsOpenChange, modeOverride, getOptimizationInput }: CanvasNodePromptPanelProps) {
     const { t } = useTranslation();
     const globalConfig = useEffectiveConfig();
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const mode = modeOverride ?? defaultMode(node.type);
-    const config = buildNodeConfig(globalConfig, node, mode);
+    const config = buildGenerationConfig(globalConfig, node, mode);
     const hasTextContent = node.type === CanvasNodeType.Text && Boolean(node.metadata?.content?.trim());
     const hasImageContent = node.type === CanvasNodeType.Image && Boolean(node.metadata?.content);
     const isEditingExistingContent = hasTextContent || hasImageContent;
@@ -134,7 +137,7 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
                     ) : mode === "video" ? (
                         <>
                             <ModelPicker config={config} value={config.model} onChange={(model) => onConfigChange(node.id, { model })} capability="video" onMissingConfig={() => openConfigDialog(true)} className="max-w-[190px]" />
-                            <CanvasVideoSettingsPopover config={config} buttonClassName="!h-10 !max-w-[220px] !justify-start !rounded-full !px-3" onConfigChange={(key, value) => onConfigChange(node.id, videoConfigPatch(key, value))} />
+                            <CanvasVideoSettingsPopover config={config} media={videoMedia} buttonClassName="!h-10 !max-w-[220px] !justify-start !rounded-full !px-3" onConfigChange={(key, value) => onConfigChange(node.id, videoConfigPatch(key, value))} />
                         </>
                     ) : mode === "audio" ? (
                         <>
@@ -203,27 +206,6 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
 
 function defaultMode(type: CanvasNodeData["type"]): CanvasNodeGenerationMode {
     return type === CanvasNodeType.Text ? "text" : type === CanvasNodeType.Video ? "video" : type === CanvasNodeType.Audio ? "audio" : "image";
-}
-
-function buildNodeConfig(globalConfig: AiConfig, node: CanvasNodeData, mode: CanvasNodeGenerationMode): AiConfig {
-    return {
-        ...globalConfig,
-        model: resolveModelForCapability(globalConfig, node.metadata?.model, mode),
-        reasoningEffort: node.metadata?.reasoningEffort || globalConfig.reasoningEffort || defaultConfig.reasoningEffort,
-        quality: node.metadata?.quality || globalConfig.quality || defaultConfig.quality,
-        size: node.metadata?.size || globalConfig.size || defaultConfig.size,
-        background: node.metadata?.background ?? globalConfig.background ?? defaultConfig.background,
-        videoSeconds: node.metadata?.seconds || globalConfig.videoSeconds || defaultConfig.videoSeconds,
-        vquality: node.metadata?.vquality || globalConfig.vquality || defaultConfig.vquality,
-        videoGenerateAudio: node.metadata?.generateAudio || globalConfig.videoGenerateAudio || defaultConfig.videoGenerateAudio,
-        videoWatermark: node.metadata?.watermark || globalConfig.videoWatermark || defaultConfig.videoWatermark,
-        videoMode: node.metadata?.videoMode || globalConfig.videoMode || defaultConfig.videoMode,
-        audioVoice: node.metadata?.audioVoice || globalConfig.audioVoice || defaultConfig.audioVoice,
-        audioFormat: node.metadata?.audioFormat || globalConfig.audioFormat || defaultConfig.audioFormat,
-        audioSpeed: node.metadata?.audioSpeed || globalConfig.audioSpeed || defaultConfig.audioSpeed,
-        audioInstructions: node.metadata?.audioInstructions || globalConfig.audioInstructions || defaultConfig.audioInstructions,
-        count: String(node.metadata?.count || (mode === "image" ? globalConfig.canvasImageCount || globalConfig.count : globalConfig.count) || defaultConfig.count),
-    };
 }
 
 function videoConfigPatch(key: keyof AiConfig, value: string) {

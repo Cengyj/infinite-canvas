@@ -19,6 +19,9 @@ const previewStore = localforage.createInstance({ name: "infinite-canvas", store
 const imageLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
 const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
 const objectUrls = new Map<string, string>();
+// New files remain protected until cleanup observes a committed owner and all writes have settled.
+const unclaimedKeys = new Map<string, number>();
+let ownershipRevision = 0;
 const previewUrls = new Map<string, string>();
 const previewListeners = new Set<() => void>();
 let previewRevision = 0;
@@ -51,8 +54,10 @@ export async function uploadImage(input: string | Blob, options?: ImageReadOptio
 
 async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<UploadedImage> {
     const storageKey = `image:${nanoid()}`;
-    const url = URL.createObjectURL(blob);
+    unclaimedKeys.set(storageKey, 1);
+    let url = "";
     try {
+        url = URL.createObjectURL(blob);
         const meta = await loadImageMeta(url, options);
         if (!meta) throw new Error(i18n.t("common.imageReadFailed"));
         throwIfAborted(options?.signal);
@@ -62,9 +67,14 @@ async function storeImage(blob: Blob, options?: ImageReadOptions): Promise<Uploa
         await storeImagePreview(storageKey, blob);
         return { url, storageKey, width: meta.width, height: meta.height, bytes: blob.size, mimeType: blob.type.startsWith("image/") ? blob.type : "" };
     } catch (error) {
-        URL.revokeObjectURL(url);
+        if (url) URL.revokeObjectURL(url);
+        objectUrls.delete(storageKey);
+        unclaimedKeys.delete(storageKey);
+        await deleteImagePreview(storageKey);
         await store.removeItem(storageKey).catch(() => undefined);
         throw error;
+    } finally {
+        if (unclaimedKeys.has(storageKey)) unclaimedKeys.set(storageKey, unclaimedKeys.get(storageKey)! - 1);
     }
 }
 
@@ -214,12 +224,17 @@ async function deleteImagePreview(storageKey: string) {
 }
 
 export async function setImageBlob(storageKey: string, blob: Blob) {
-    await store.setItem(storageKey, blob);
-    await deleteImagePreview(storageKey);
-    await storeImagePreview(storageKey, blob);
-    const url = URL.createObjectURL(blob);
-    objectUrls.set(storageKey, url);
-    return url;
+    unclaimedKeys.set(storageKey, (unclaimedKeys.get(storageKey) || 0) + 1);
+    try {
+        await store.setItem(storageKey, blob);
+        await deleteImagePreview(storageKey);
+        await storeImagePreview(storageKey, blob);
+        const url = URL.createObjectURL(blob);
+        objectUrls.set(storageKey, url);
+        return url;
+    } finally {
+        if (unclaimedKeys.has(storageKey)) unclaimedKeys.set(storageKey, unclaimedKeys.get(storageKey)! - 1);
+    }
 }
 
 export async function imageToDataUrl(image: { url?: string; dataUrl?: string; storageKey?: string }, options?: ImageReadOptions) {
@@ -232,33 +247,47 @@ export async function deleteStoredImages(keys: Iterable<string>) {
     await Promise.all(
         Array.from(new Set(keys)).map(async (key) => {
             const url = objectUrls.get(key);
+            const claim = unclaimedKeys.get(key);
+            await store.removeItem(key);
+            if (objectUrls.get(key) !== url || unclaimedKeys.get(key) !== claim) {
+                if (url && objectUrls.get(key) !== url) URL.revokeObjectURL(url);
+                return;
+            }
             if (url) URL.revokeObjectURL(url);
             objectUrls.delete(key);
+            unclaimedKeys.delete(key);
             await deleteImagePreview(key);
-            await store.removeItem(key);
         }),
     );
 }
 
 export async function cleanupUnusedImages(usedData: unknown) {
-    const usedKeys = collectImageStorageKeys(usedData);
-    await Promise.all([
-        imageLogStore.iterate((value) => {
-            collectImageStorageKeys(value, usedKeys);
-        }),
-        videoLogStore.iterate((value) => {
-            collectImageStorageKeys(value, usedKeys);
-        }),
-    ]);
-    const unused: string[] = [];
-    await store.iterate((_value, key) => {
-        if (!usedKeys.has(key)) unused.push(key);
-    });
-    const orphanPreviews: string[] = [];
-    await previewStore.iterate((_value, key) => {
-        if (!usedKeys.has(key)) orphanPreviews.push(key);
-    });
-    await Promise.all([deleteStoredImages(unused), ...orphanPreviews.map(deleteImagePreview)]);
+    const revision = ownershipRevision;
+    const readUsedData = () => typeof usedData === "function" ? usedData() : usedData;
+    const usedKeys = new Set<string>();
+    const keys = new Set<string>();
+    const previews: string[] = [];
+    try {
+        const initial = readUsedData();
+        if (initial == null) return;
+        collectImageStorageKeys(initial, usedKeys);
+        await Promise.all([
+            imageLogStore.iterate((value) => { collectImageStorageKeys(value, usedKeys); }),
+            videoLogStore.iterate((value) => { collectImageStorageKeys(value, usedKeys); }),
+            store.iterate((_value, key) => { keys.add(key); }),
+            previewStore.iterate((_value, key) => { previews.push(key); }),
+        ]);
+        const current = readUsedData();
+        if (current == null) return;
+        collectImageStorageKeys(current, usedKeys);
+    } catch { return; }
+    if (ownershipRevision !== revision) return;
+    for (const key of usedKeys) if (unclaimedKeys.get(key) === 0) {
+        unclaimedKeys.delete(key);
+        ownershipRevision++;
+    }
+    const unused = (key: string) => !usedKeys.has(key) && !unclaimedKeys.has(key);
+    await Promise.all([deleteStoredImages([...keys].filter(unused)), ...previews.filter((key) => !keys.has(key) && unused(key)).map(deleteImagePreview)]);
 }
 
 export function collectImageStorageKeys(value: unknown, keys = new Set<string>()) {

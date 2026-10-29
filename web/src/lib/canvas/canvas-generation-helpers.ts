@@ -1,5 +1,6 @@
 import { defaultConfig, resolveModelForCapability, type AiConfig } from "@/stores/use-config-store";
 import i18n from "@/i18n";
+import { getGrokVideoModel } from "@/lib/video-generation-config";
 import { ensureImagePreview, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { resolveMediaUrl } from "@/services/file-storage";
 import { imageMetadata, referenceUrl } from "@/lib/canvas/canvas-node-factory";
@@ -103,7 +104,7 @@ export function getInputSummary(inputs: NodeGenerationInput[]) {
 }
 
 export function buildGenerationConfig(config: AiConfig, node: CanvasNodeData | undefined, mode: CanvasNodeGenerationMode): AiConfig {
-    return {
+    const result: AiConfig = {
         ...config,
         model: resolveModelForCapability(config, node?.metadata?.model, mode),
         reasoningEffort: node?.metadata?.reasoningEffort || config.reasoningEffort || defaultConfig.reasoningEffort,
@@ -121,6 +122,13 @@ export function buildGenerationConfig(config: AiConfig, node: CanvasNodeData | u
         audioInstructions: node?.metadata?.audioInstructions || config.audioInstructions || defaultConfig.audioInstructions,
         count: String(node?.metadata?.count || (mode === "image" ? config.canvasImageCount || config.count : config.count) || defaultConfig.count),
     };
+    if (mode === "video" && getGrokVideoModel(result)) {
+        result.size = node?.metadata?.size ?? config.size ?? defaultConfig.size;
+        result.videoSeconds = node?.metadata?.seconds ?? config.videoSeconds ?? defaultConfig.videoSeconds;
+        result.vquality = node?.metadata?.vquality ?? config.vquality ?? defaultConfig.vquality;
+        result.videoMode = node?.metadata?.videoMode ?? config.videoMode ?? defaultConfig.videoMode;
+    }
+    return result;
 }
 
 export function hasResumableVideoTask(node: CanvasNodeData) {

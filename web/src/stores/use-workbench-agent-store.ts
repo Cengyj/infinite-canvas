@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { nanoid } from "nanoid";
 
 // The Agent panel dispatches commands through this store to set workbench prompts and optionally start generation.
 // The panel writes model, quality, size, count, and other options to use-config-store, which workbench pages read directly.
@@ -43,13 +44,13 @@ export const useWorkbenchAgentStore = create<WorkbenchAgentStore>((set) => ({
     tasks: [],
     dispatchImage: (command) => {
         const commandNonce = nextNonce();
-        const task = command.run ? createTask("image", commandNonce, command.prompt) : undefined;
+        const task = command.run ? createTask("image", command.prompt) : undefined;
         set((state) => ({ imageCommand: { ...command, nonce: commandNonce, taskId: task?.id }, tasks: task ? [task, ...state.tasks].slice(0, 30) : state.tasks }));
         return task?.id;
     },
     dispatchVideo: (command) => {
         const commandNonce = nextNonce();
-        const task = command.run ? createTask("video", commandNonce, command.prompt) : undefined;
+        const task = command.run ? createTask("video", command.prompt) : undefined;
         set((state) => ({ videoCommand: { ...command, nonce: commandNonce, taskId: task?.id }, tasks: task ? [task, ...state.tasks].slice(0, 30) : state.tasks }));
         return task?.id;
     },
@@ -58,7 +59,7 @@ export const useWorkbenchAgentStore = create<WorkbenchAgentStore>((set) => ({
     clearVideoCommand: () => set({ videoCommand: null }),
 }));
 
-function createTask(kind: "image" | "video", commandNonce: number, prompt?: string): WorkbenchGenerationTask {
+function createTask(kind: "image" | "video", prompt?: string): WorkbenchGenerationTask {
     const now = new Date().toISOString();
-    return { id: `${kind}-${commandNonce}`, kind, status: "queued", prompt, createdAt: now, updatedAt: now };
+    return { id: `${kind}-${nanoid()}`, kind, status: "queued", prompt, createdAt: now, updatedAt: now };
 }

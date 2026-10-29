@@ -1,0 +1,123 @@
+---
+title: Grok Video Request and Frontend Constraints
+description: Six-field JSON and unified image references for built-in Grok, with sampled provider boundaries; full-page acceptance remains pending
+---
+
+# Grok Video Request and Frontend Constraints
+
+The current reliability changes preserve the existing UI, model protocols and approved Grok limits. They focus on reference-import ownership, stale asynchronous work and cancellation, with request validation and payload construction kept in existing layers. Prior provider samples and the single-reference 1080p regression remain historical evidence; no new paid generation is included. Full browser workflows and model quality still require acceptance.
+
+## Scope and architecture
+
+Strict-review cleanup: remove five duplicated request-parameter converters, page forwarding helpers and an unused constant; settings read global actions directly. Imports only identify the model and reuse the seven-image constant instead of resolving unrelated generation parameters. Agent validation reuses its result and one unsupported-field list; tool descriptions now match the six-field contract. Simplify redundant optimizer branches while retaining the UI, protocols, limits and comments explaining cancellation, queue order and file ownership.
+
+Match only `grok-imagine-video` and `grok-imagine-video-1.5` with video capability, an OpenAI-format provider and no saved call script. The workbench supplies its effective `videoModel`; canvas uses node configuration and selected resources. Unknown aliases, Gemini providers and saved scripts do not receive built-in Grok rules.
+
+- Entry points own snapshots and application; retain canvas group expansion, token selection and deduplication. The page-private `pages/video/use-video-references.ts` factory owns asynchronous import sessions; its hook owns React state and UI feedback, without global import state.
+- Pure functions in `lib/video-generation-config.ts` resolve effective parameters and issues without side effects or silent correction. Shared assertion returns verified settings, so creation reuses one resolution rather than parsing again.
+- `services/api/video.ts` separates Grok JSON and generic multipart body builders in the same file and shares POST handling. Other OpenAI payloads, Gemini protocol and saved-script priority remain intact.
+- Reuse task IDs, providers, polling, downloads, local storage, authentication and direct/proxy routing. Shared cancellation normalizes to AbortError, rechecks after polling results and removes delay listeners; this adds no task system, timeout, retry or concurrency setting.
+- Keep optimization service, hook and dialog layers; synchronize context/snapshots without replacing session protection.
+
+## Request contract and provider evidence
+
+Earlier provider research followed yuanai.uk’s `/api/status` documentation link to the [Grok API document](https://qingfeng.apifox.cn/497886448e0.md). That document and the earlier completed requests used JSON `POST /v1/videos` with Bearer authentication and these six fields. The current implementation retains that contract; this example is structural and contains no real media:
+
+```json
+{
+  "model": "grok-imagine-video-1.5",
+  "prompt": "Let the kitten in the image run forward naturally",
+  "seconds": "6",
+  "aspect_ratio": "16:9",
+  "resolution": "720p",
+  "reference_images": [{"url": "data:image/png;base64,<complete image content>"}]
+}
+```
+
+Seconds remains a string; resolution uses 480p/720p/1080p. Each reference is one complete original data URL object in actual order. Derive aspect_ratio from the existing size/ratio control and resolution from its control. Do not send size or images. No-image requests use an empty reference array; sampled no-image tasks completed.
+
+Do not send mode, first_frame, last_frame, image[], resolution_name, generate_audio or watermark. One through seven images remain ordinary references, never inferred start/end frames; first-frame mode was not tested. Retain shared legacy settings for other models without migration. Other OpenAI multipart, Gemini, saved scripts and task processing stay unchanged.
+
+Earlier requests established this yuanai.uk contract, not native xAI or every gateway. Four prior real project-service calls verified creation and polling; complete browser workflows and other providers still require separate acceptance.
+
+The following results belong to the earlier sampling rounds; the current reliability work adds no paid generation. After replenishment, 27 creation attempts comprised 23 isolated HTTP requests and four real project-service calls: 16 tasks completed, all with downloaded metadata checked, and 11 were explicitly rejected for parameters; none failed for balance. Across both rounds, 40 attempts produced 21 completed tasks, 14 protocol/parameter rejections and five historical HTTP 403 balance failures. The original balance failures are not capability rejections. Only ordinary references were sampled, without first-frame mode.
+
+| Request | Observed result | Evidence boundary |
+| --- | --- | --- |
+| Both models, one image, six seconds, old size/images five-field body | Two HTTP 400 responses: unknown field images | The old contract is rejected by this provider. |
+| Classic, one image, six seconds, 480p / 720p; 1.5 at 480p / 720p / 1080p | All five tasks completed | Single-image baseline; 1.5 single-reference 1080p is now approved and implemented locally. |
+| Classic, no images, fifteen seconds, 480p / 720p; 1.5 at all three resolutions | All five tasks completed | Empty ordinary-reference arrays work in these combinations. |
+| Classic, seven images, ten seconds, 480p / 720p; 1.5, seven images, fifteen seconds, 480p / 720p | All four tasks completed | Confirms sampled count/duration upper boundaries, not every intermediate combination. |
+| 1.5, one image, one/fifteen seconds, 1080p; no images, one second, 1080p | All three tasks completed | These prior samples support the now-approved local single-reference 1080p rule. |
+| Both models, seven images, one second, 480p / 720p | All four real project-service tasks completed | Bun ran actual createVideoGenerationTask and pollVideoGenerationTask with real Axios requests and no mocks. |
+| Classic, no/one image, six seconds, 1080p | HTTP 400 explicitly rejecting 1080p | Classic resolution rejection. |
+| Classic, seven images, fifteen seconds or one image, eleven seconds, at 480p / 720p | HTTP 400, image-input maximum ten seconds | Explicit duration rejection for these combinations. |
+| 1.5, two images/six seconds or seven images/fifteen seconds, 1080p | HTTP 400, maximum one image at 1080p | Keep ordinary reference_images semantics; the error does not justify switching to a first-frame field. |
+| Both models, eight images, six seconds, 720p | HTTP 400, maximum seven references | Explicit image-count rejection. |
+| Both models, no images, sixteen seconds, 720p | HTTP 400 | Explicit duration rejection. |
+
+All 21 completed samples across the two earlier rounds were downloaded and their metadata checked. The initial five also passed isolated browser metadata inspection: readyState=4, no media error and duration approximately 6.041667 seconds. Later samples were inspected with Hachoir, including the four project-service one-second tasks and 1.5 no-image/single-image one-second 1080p samples at approximately 1.042 seconds. Sample dimensions were 848x480 at 480p, 1280x720 at 720p and 1920x1088 at 1080p. A few completed media downloads initially encountered HTTP/TLS errors; manually reading the existing URLs again succeeded, without resubmitting generation or changing production retry behavior.
+
+Those earlier requests were key-boundary samples, not an exhaustive resolution × image-count × second matrix or visual-quality approval. Intermediate combinations, full browser workflows, and cancellation/recovery interactions remain separate acceptance work. No exact output-pixel guarantee follows from these samples.
+
+## Current local policy
+
+The user approved matching the sampled boundary: 1.5 supports 1080p with zero or one actual ordinary reference image; two through seven images remain limited to 480/720p. The shared resolver and conditional Agent description use the same rule. Classic limits, the seven-image total limit, durations and 6-second/720p/1:1 defaults remain unchanged; the 16:9 example does not change them.
+
+| Model | Actual images | Input meaning | Duration | Resolution |
+| --- | --- | --- | --- | --- |
+| `grok-imagine-video` | 0 | Text-to-video | 1–15 seconds | 480/720p |
+| `grok-imagine-video` | 1–7 | Ordinary references | 1–10 seconds | 480/720p |
+| `grok-imagine-video-1.5` | 0 | Text-to-video | 1–15 seconds | 480/720/1080p |
+| `grok-imagine-video-1.5` | 1 | Ordinary reference | 1–15 seconds | 480/720/1080p |
+| `grok-imagine-video-1.5` | 2–7 | Ordinary references | 1–15 seconds | 480/720p |
+
+Keep ratios 1:1, 3:4, 4:3, 16:9, 9:16 and 21:9 and matching derived pixel sizes. Reject auto/arbitrary dimensions and video/audio attachments. Basic checks reject empty sources, non-image/non-base64 data URLs and empty content; they are not complete image decoding. Preserve the read signal and prevent POST after canceled assembly. Preserve invalid raw settings and report errors before submission without truncating images, switching mode, lowering resolution or shortening duration.
+
+Keep 120 polling attempts and the 2.5-second pending interval; add no timeout, retry, file-size or concurrency limit. Attempts are not a strict wall-clock timeout. Cancellation fixes protect existing request/result boundaries without changing task recovery semantics.
+
+## UI, media and Agent
+
+Response validation stays in the public request layer. Failed/cancelled states take precedence over leftover result URLs. HTTP failures and JSON-declared content, including malformed bodies, cannot become video success. Local persistence errors propagate; only network/CORS download failures retain URL fallback. Cancellation remains AbortError. Original model/channel validation, same-channel credential rotation and cached script recovery remain unchanged.
+
+Canvas projects use route-keyed instances. Layout cleanup invalidates controllers, and restore/preflight continuations cannot register requests after leave. One controller Map owns tasks; removing the duplicate polling Set allows immediate stop/retry without old finalizers clearing newer work.
+
+Preserve the four-column resolution row, W/H, auto ratio, duration slider and both original mode controls. Unsupported controls stay visible but disabled: 1.5 exposes 1080p for zero/one image and disables it for two through seven. If a second image is added after choosing 1080p, preserve both images and the raw setting; report a resolution issue before submission without truncation or automatic downgrade. Grok mode buttons have no effective selection and summaries omit legacy mode. Add no explanation panels, counters or persistent errors; other models/scripts retain their controls.
+
+Built-in Grok imports count existing and pending images against seven, reject oversized batches and commit in invocation order. Capture sessions before clipboard reads; Grok model round trips and script changes invalidate them immediately. Reset/unmount abort uploads and release gates waiting behind old clipboard work. After Promise.allSettled, clean only unclaimed temporary keys; stale results/errors, including invalidation during cleanup, do not enter the current session. Grok generation still waits for pending imports.
+
+Non-Grok imports retain available-capacity clipping, asset-picker closure at seven, successful zero-added paste feedback and original clipboard-read errors. Empty-state wording now reads the existing seven-image constant; the actual limit and layout are unchanged.
+
+Canvas still validates actual expanded/deduplicated selection. After video storage, one synchronous publication checks ownership, commits the node and confirms receipt before claimStoredMedia transfers the new key. Even a renderer error after receipt cannot delete owned media. Missing/replaced/canceled targets delete only unpublished new keys. Shared GC includes video logs and live asset/project/draft roots, protects in-flight writes, and stops a scan if ownership changed. Hydration/read failure never becomes an empty authoritative collection. Cross-tab transactions are not guaranteed by this in-process mechanism.
+
+Agent returns six request fields and `referenceCountsKnown: false` without guessing workbench-local media. Classic retains no-image/image conditions; 1.5 exposes three ranges (zero, one, two through seven images), matching resolution eligibility. It does not advertise mode/audio/watermark as Grok controls. Explicit `mode`, `generateAudio` or `watermark` rejects the entire update before writes rather than reporting ignored values as applied. Retain the generic schema for other models; actual generation validates real media counts.
+
+The page-private video-generation-tasks coordinator separates mounted views from log-owned runs and serializes writes/deletions per log. Only the latest read updates logs; ordinary refreshes do not trigger repeated recovery. Leaving aborts queries but preserves late creation IDs and lets an active storage commit finish once. Deletion invalidates late updates and restores failed removals. Failed writes keep a session-only authoritative failed record, and recovery retries the original task without recreating it. Terminal state and retry parameters are taken from the current record. Shared GC retains draft references; successful log persistence explicitly claims media. Agent tasks use unique IDs independent of command nonces; deleting pending records reports tracking stopped, not remote cancellation.
+
+## Optimization context
+
+The selected text model rewrites; Grok is the target generator. Valid images use `reference-image` / `reference`; no images means no frame roles. Invalid counts do not imply executable inputs; omit invalid duration/resolution/size. Read-only `generationIssues` must not enter the prompt or induce invented settings.
+
+Grok frameSize describes the submitted aspect_ratio and quality describes resolution, without claiming exact requested pixel dimensions. Grok sends no audio control, so `audioEnabled` is absent rather than false. Preserve creative sound requests without promising provider control or silence. Local identity retains model, provider, protocol, URL, script and raw size/duration/resolution; legacy mode/audio/watermark alone do not stale Grok results. Other models/scripts keep their comparisons.
+
+Preserve opt-in original-image analysis, reference order, token first-appearance order, read-only upstream text, cancellation/late-response protection, complete drafts after failed refinement and apply-only behavior.
+
+## Pending acceptance
+
+These are test conditions and criteria, not real-model outputs:
+
+| Input | Required outcome |
+| --- | --- |
+| Either model, no images, 6 seconds, 720p | Browser entry points submit six fields with empty reference_images, aspect_ratio=1:1 and resolution=720p; sampled provider no-image completion is recorded above. |
+| One kitten image, 6 seconds, 16:9, 720p | aspect_ratio=16:9, resolution=720p and complete original URL object once; optimizer frameSize uses ratio without claiming a first frame. |
+| Seven reordered images with overlapping groups | Actual selected-resource order, no duplicate resources, matching optimizer labels, no invented start/end roles. |
+| Eight images; classic with images at 11 seconds; 1.5 with 2–7 images at 1080p | Reject before media reads/generation requests, preserving settings and media; 1.5 multi-image 1080p produces a resolution issue. |
+| Classic without images at 15 seconds; 1.5 with zero/one image at 1080p; valid 1/3 seconds | Preserve accepted values without four-second clamping; a single image remains an ordinary reference, with no inferred first-frame role. |
+| Change only legacy mode/audio/watermark | Identical Grok request/context without shared-state rewrites; no regressions to other models/scripts. |
+| Clipboard reading, overlapping imports, Grok model/script switches, reset/unmount and cleanup | Preserve order/capacity; stale work cannot append media or report errors; new imports cannot hang behind old clipboard gates; clean only unclaimed temporary files. |
+| Cancellation, route changes or storage completion | Old work cannot publish into another project. Synchronous publication transfers ownership only after node acceptance; missing/replaced nodes clean only unpublished new keys. |
+| Agent model change plus unsupported fields | Final-model atomic validation with no partial writes; other models/scripts retain controls. |
+| Workbench, regular/expanded canvas, config composer | Preserve layout/theme, disabled states, summaries, empty drafts, tokens, upstream text and sessions. |
+| Non-Grok OpenAI, Gemini, saved scripts | Preserve payloads, parameter behavior, tasks and script autonomy. |
+
+Current combined behavioral regression actually ran 14 files: 338 passed, 0 failed, 2019 assertions and exit code 0. A separate image-thumbnail.test.ts run passed 3 tests with 0 failures and 3 assertions. The exact command is in Pending Tests. Permanent suites cover request errors, task/view ownership, storage failure, deletion, shared GC, hydration, Agent identity and existing optimizer/model behavior. Isolated port-3001 browser fixtures mount actual workbench/canvas components under StrictMode with synthetic video and real IndexedDB. Verified new-session isolation, query-only retry, leaving during creation, pending deletion, shared-asset survival, invalid 1080p preservation, project-switch isolation, canceled late responses, missing-project redirect and refresh without repeat download; no flushSync lifecycle warning appeared. Earlier 205/1592 and other regressions plus 40 provider requests remain historical. No paid generation, syntax checks, type checks or builds ran. Real-provider quality, cross-tab/long-running stress and production deployment remain release acceptance work.

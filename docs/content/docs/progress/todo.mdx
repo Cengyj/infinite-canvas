@@ -7,4 +7,4 @@ description: Planned follow-up work
 
 - Replace the Claude Code CLI adapter with a Claude Agent SDK adapter and improve the tool queue, following the [Local Agent Integration Plan](/docs/progress/local-agent-integration-plan).
 - Add Skill installation from web search, Skill resource-file management, and controlled local-memory persistence.
-- Audit and fix shared media cleanup (unresolved): cleanup currently scans a fixed reference snapshot and may delete a newly stored file before ownership is assigned, or after that stale scan even if a node has since accepted it. Verify whether image/video workbench logs are included in every reference scan.
+- Video release acceptance: task ownership, shared cleanup and recovery moved to Pending Tests with isolated browser/behavioral evidence. Verify current provider compatibility and quality, concurrent tabs, long-running quota pressure and production deployment. Complete regular/expanded-node and composer manual acceptance without first-frame testing; see [Pending Tests](/docs/progress/pending-test).

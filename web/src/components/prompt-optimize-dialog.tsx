@@ -113,11 +113,17 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
             style={{ maxWidth: "calc(100vw - 24px)" }}
             styles={{ body: { maxHeight: "calc(100dvh - 190px)", overflowY: "auto", paddingTop: 12 }, footer: { borderTop: `1px solid ${token.colorBorderSecondary}`, paddingTop: 14 } }}
             title={<div className="flex items-center gap-2.5"><WandSparkles className="size-4" /><span>{text("title")}</span><span className="ml-1 text-xs font-normal" style={{ color: token.colorTextSecondary }}>{text(input.scenario === "image" ? "image" : "video")}</span></div>}
-            footer={<div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs" style={{ color: token.colorTextSecondary }}>{text("applyHint")}</span>
-                <div className="flex items-center gap-1.5">
-                    <Button type="text" onClick={close}>{t("common.cancel")}</Button>
-                    <Button type="primary" icon={<Check className="size-4" />} disabled={!canApply} onClick={() => canApply && result && onApply(result.text.trim())}>{text("apply")}</Button>
+            footer={<div className="space-y-2.5">
+                <p className="m-0 text-left text-xs" style={{ color: token.colorTextSecondary }}>{text("applyHint")}</p>
+                <div className="thin-scrollbar flex items-center justify-between gap-3 overflow-x-auto">
+                    <div className="flex shrink-0 items-center gap-1.5">
+                        {busy ? <Button type="text" danger icon={<Square className="size-3.5" />} onClick={stop}>{text("stop")}</Button> : <Button type="text" icon={<WandSparkles className="size-4" />} disabled={stale || !configReady || !sourceTokensValid || !source.trim()} onClick={() => void optimize()}>{text(result ? "retry" : "start")}</Button>}
+                        {result ? <Button type="text" icon={<ArrowRight className="size-3.5" />} disabled={!canContinue} onClick={() => void optimize(result.text)}>{text("continue")}</Button> : null}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                        <Button type="text" onClick={close}>{t("common.cancel")}</Button>
+                        <Button type="primary" icon={<Check className="size-4" />} disabled={!canApply} onClick={() => canApply && result && onApply(result.text.trim())}>{text("apply")}</Button>
+                    </div>
                 </div>
             </div>}
         >
@@ -166,11 +172,6 @@ export function PromptOptimizeDialog({ input, stale, onRefresh, onApply, onClose
                     <div className="mt-3 flex gap-2.5 overflow-x-auto pb-1">{input.references.map((reference, index) => <Tooltip key={`${reference.id}-${index}`} title={reference.name}><div className="w-14 shrink-0"><img src={reference.dataUrl || reference.url} alt={reference.name} className="size-14 rounded-lg object-cover" /><div className="mt-1 truncate text-center text-[11px]" style={{ color: token.colorTextSecondary }}>{imageReferenceLabel(index)}</div></div></Tooltip>)}</div>
                 </div> : null}
                 {input.context.upstreamText || input.context.videoReferences?.length || input.context.audioReferences?.length ? <p className="m-0 text-xs leading-5" style={{ color: token.colorTextSecondary }}>{text("contextHint")}</p> : null}
-
-                <div className="flex flex-wrap items-center gap-2">
-                    {busy ? <Button type="text" danger icon={<Square className="size-3.5" />} onClick={stop}>{text("stop")}</Button> : <Button type="text" icon={<WandSparkles className="size-4" />} disabled={stale || !configReady || !sourceTokensValid || !source.trim()} onClick={() => void optimize()}>{text(result ? "retry" : "start")}</Button>}
-                    {result ? <Button type="text" icon={<ArrowRight className="size-3.5" />} disabled={!canContinue} onClick={() => void optimize(result.text)}>{text("continue")}</Button> : null}
-                </div>
             </div>
         </Modal>
     );

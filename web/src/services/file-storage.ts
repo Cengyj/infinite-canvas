@@ -1,21 +1,43 @@
 import localforage from "localforage";
 import { nanoid } from "nanoid";
 
+import i18n from "@/i18n";
 import { withLocalProxy } from "@/stores/use-config-store";
 
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
+const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
 const objectUrls = new Map<string, string>();
+// Keep new files until an authoritative reference is observed; the count covers active writes.
+const unclaimedKeys = new Map<string, number>();
+let ownershipRevision = 0;
 
 export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
-    const blob = typeof input === "string" ? await (await fetch(withLocalProxy(input))).blob() : input;
+    let blob: Blob;
+    if (typeof input === "string") {
+        const response = await fetch(withLocalProxy(input));
+        if (!response.ok) throw new Error(i18n.t("apiErrors.httpFailed", { status: response.status }));
+        blob = await response.blob();
+    } else blob = input;
     const storageKey = `${prefix}:${nanoid()}`;
-    await store.setItem(storageKey, blob);
-    const url = URL.createObjectURL(blob);
-    objectUrls.set(storageKey, url);
-    const meta = blob.type.startsWith("video/") ? await readVideoMeta(url) : blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
-    return { url, storageKey, bytes: blob.size, mimeType: blob.type || "application/octet-stream", ...meta };
+    unclaimedKeys.set(storageKey, 1);
+    let url = "";
+    try {
+        await store.setItem(storageKey, blob);
+        url = URL.createObjectURL(blob);
+        objectUrls.set(storageKey, url);
+        const meta = blob.type.startsWith("video/") ? await readVideoMeta(url) : blob.type.startsWith("audio/") ? await readAudioMeta(url) : {};
+        return { url, storageKey, bytes: blob.size, mimeType: blob.type || "application/octet-stream", ...meta };
+    } catch (error) {
+        if (url) URL.revokeObjectURL(url);
+        objectUrls.delete(storageKey);
+        unclaimedKeys.delete(storageKey);
+        await store.removeItem(storageKey).catch(() => undefined);
+        throw error;
+    } finally {
+        if (unclaimedKeys.has(storageKey)) unclaimedKeys.set(storageKey, unclaimedKeys.get(storageKey)! - 1);
+    }
 }
 
 export async function resolveMediaUrl(storageKey?: string, fallback = "") {
@@ -34,30 +56,60 @@ export async function getMediaBlob(storageKey: string) {
 }
 
 export async function setMediaBlob(storageKey: string, blob: Blob) {
-    await store.setItem(storageKey, blob);
-    const url = URL.createObjectURL(blob);
-    objectUrls.set(storageKey, url);
-    return url;
+    unclaimedKeys.set(storageKey, (unclaimedKeys.get(storageKey) || 0) + 1);
+    try {
+        await store.setItem(storageKey, blob);
+        const url = URL.createObjectURL(blob);
+        objectUrls.set(storageKey, url);
+        return url;
+    } finally {
+        if (unclaimedKeys.has(storageKey)) unclaimedKeys.set(storageKey, unclaimedKeys.get(storageKey)! - 1);
+    }
+}
+
+// Call only after an authoritative owner has successfully published the file.
+export function claimStoredMedia(storageKey: string) {
+    if (unclaimedKeys.get(storageKey) === 0) {
+        unclaimedKeys.delete(storageKey);
+        ownershipRevision++;
+    }
 }
 
 export async function deleteStoredMedia(keys: Iterable<string>) {
     await Promise.all(
         Array.from(new Set(keys)).map(async (key) => {
             const url = objectUrls.get(key);
+            const claim = unclaimedKeys.get(key);
+            await store.removeItem(key);
+            if (objectUrls.get(key) !== url || unclaimedKeys.get(key) !== claim) {
+                if (url && objectUrls.get(key) !== url) URL.revokeObjectURL(url);
+                return;
+            }
             if (url) URL.revokeObjectURL(url);
             objectUrls.delete(key);
-            await store.removeItem(key);
+            unclaimedKeys.delete(key);
         }),
     );
 }
 
 export async function cleanupUnusedMedia(usedData: unknown) {
-    const usedKeys = collectMediaStorageKeys(usedData);
-    const unused: string[] = [];
-    await store.iterate((_value, key) => {
-        if (!usedKeys.has(key)) unused.push(key);
-    });
-    await Promise.all(unused.map((key) => store.removeItem(key)));
+    const revision = ownershipRevision;
+    const readUsedData = () => typeof usedData === "function" ? usedData() : usedData;
+    const usedKeys = new Set<string>();
+    const keys: string[] = [];
+    try {
+        const initial = readUsedData();
+        if (initial == null) return;
+        collectMediaStorageKeys(initial, usedKeys);
+        await videoLogStore.iterate((value) => { collectMediaStorageKeys(value, usedKeys); });
+        await store.iterate((_value, key) => { keys.push(key); });
+        const current = readUsedData();
+        if (current == null) return;
+        collectMediaStorageKeys(current, usedKeys);
+    } catch { return; }
+    if (ownershipRevision !== revision) return;
+    for (const key of usedKeys) claimStoredMedia(key);
+    await deleteStoredMedia(keys.filter((key) => !usedKeys.has(key) && !unclaimedKeys.has(key)));
 }
 
 export function collectMediaStorageKeys(value: unknown, keys = new Set<string>()) {

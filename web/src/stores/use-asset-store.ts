@@ -32,7 +32,7 @@ type AssetStore = {
     updateAsset: (id: string, patch: Partial<Omit<Asset, "id" | "createdAt">>) => void;
     removeAsset: (id: string) => void;
     replaceAssets: (assets: Asset[]) => void;
-    cleanupImages: (extra?: unknown) => void;
+    cleanupImages: (extra?: unknown) => Promise<void>;
 };
 
 // 卡片用缩略图渲染，自定义封面（远程地址或单独上传的封面）保持原样。
@@ -94,20 +94,26 @@ export const useAssetStore = create<AssetStore>()(
                     return { assets };
                 }),
             replaceAssets: (assets) => set({ assets }),
-            cleanupImages: (extra) => {
-                window.setTimeout(async () => {
-                    const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
-                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                    await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                }, 0);
+            cleanupImages: async (extra) => {
+                await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
+                if (!get().hydrated || !useCanvasStore.getState().hydrated) return;
+                const readUsedData = () => {
+                    const assets = get();
+                    const canvas = useCanvasStore.getState();
+                    if (!assets.hydrated || !canvas.hydrated) return null;
+                    return { assets: assets.assets, projects: canvas.projects, extra: typeof extra === "function" ? extra() : extra };
+                };
+                await cleanupUnusedImages(readUsedData);
+                await cleanupUnusedMedia(readUsedData);
             },
         }),
         {
             name: ASSET_STORE_KEY,
             storage: assetStorage,
             partialize: (state) => ({ assets: state.assets }) as StorageValue<AssetStore>["state"],
-            onRehydrateStorage: () => () => {
-                useAssetStore.setState({ hydrated: true });
+            onRehydrateStorage: () => (_state, error) => {
+                if (!error) useAssetStore.setState({ hydrated: true });
             },
         },
     ),

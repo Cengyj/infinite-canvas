@@ -6,10 +6,10 @@ import { uploadImage } from "@/services/image-storage";
 import { imageAspectOptions, imageQualityOptions, imageScaleOptions } from "@/components/image-settings-panel";
 import { videoResolutionOptions, videoSecondsRange, videoSizeOptions } from "@/components/video-settings-panel";
 import type { CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
-import { clampVideoSeconds } from "@/lib/media-size";
+import { assertVideoGenerationConfig, getGrokVideoModel, resolveVideoGenerationConfig, videoGenerationIssueText } from "@/lib/video-generation-config";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
-import { modelOptionLabel, modelOptionName, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore } from "@/stores/use-config-store";
+import { modelOptionLabel, modelOptionName, normalizeModelOptionValue, selectableModelsByCapability, useConfigStore, type AiConfig } from "@/stores/use-config-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 
 // Execute site-level Agent tools in the browser, including canvas lists, workbench generation, prompt search, and asset operations.
@@ -50,6 +50,7 @@ export const SITE_TOOL_LABELS: Record<SiteToolName, string> = {
 };
 
 type SiteToolInput = Record<string, unknown>;
+const GROK_UNSUPPORTED_VIDEO_PARAMETERS = ["mode", "generateAudio", "watermark"] as const;
 type SiteToolContext = { canvasSnapshot?: CanvasAgentSnapshot | null };
 type GenerationStatus = "idle" | "queued" | "running" | "succeeded" | "failed";
 type GenerationStatusItem = { id: string; source: "canvas" | "image" | "video"; status: GenerationStatus; kind?: string; title?: string; prompt?: string; projectId?: string; createdAt?: string; updatedAt?: string; successCount?: number; failCount?: number; error?: string };
@@ -190,61 +191,85 @@ function runImageWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
 function getVideoConfig() {
     const { config } = useConfigStore.getState();
     const model = config.videoModel || config.model;
+    const generationConfig = { ...config, model };
+    const resolved = resolveVideoGenerationConfig(generationConfig);
+    const constraintsFor = (minImages: number, maxImages: number) => {
+        const { limits } = resolveVideoGenerationConfig(generationConfig, { imageCount: minImages });
+        return { minImages, maxImages, secondsRange: { min: limits.minSeconds, max: limits.maxSeconds }, resolutions: limits.resolutions };
+    };
     return {
         current: {
             model,
             modelName: modelOptionName(model),
-            size: config.size || "1280x720",
-            seconds: config.videoSeconds || "6",
-            resolution: config.vquality || "720",
-            generateAudio: config.videoGenerateAudio !== "false",
-            watermark: config.videoWatermark === "true",
-            mode: config.videoMode === "reference" ? "reference" : "frames",
+            size: resolved.grok ? config.size : config.size || "1280x720",
+            seconds: resolved.grok ? config.videoSeconds : config.videoSeconds || "6",
+            resolution: resolved.grok ? config.vquality : config.vquality || "720",
+            ...(!resolved.grok ? {
+                generateAudio: config.videoGenerateAudio !== "false",
+                watermark: config.videoWatermark === "true",
+                mode: config.videoMode === "reference" ? "reference" : "frames",
+            } : {}),
         },
         models: selectableModelsByCapability(config, "video").map((value) => ({ value, label: modelOptionLabel(config, value) })),
-        sizeOptions: videoSizeOptions,
-        secondsRange: videoSecondsRange,
-        resolutionOptions: videoResolutionOptions,
-        modeOptions: [
+        sizeOptions: resolved.grok ? videoSizeOptions.filter((option) => option.value !== "auto") : videoSizeOptions,
+        secondsRange: resolved.grok ? { min: resolved.limits.minSeconds, max: resolved.limits.maxSeconds } : videoSecondsRange,
+        resolutionOptions: resolved.grok ? resolved.limits.resolutions.map((value) => ({ value, label: `${value}p` })) : videoResolutionOptions,
+        modeOptions: resolved.grok ? [] : [
             { value: "frames", label: i18n.t("settingsPanels.video.modes.frames") },
             { value: "reference", label: i18n.t("settingsPanels.video.modes.reference") },
         ],
+        ...(resolved.grok ? {
+            requestFields: ["model", "prompt", "seconds", "aspect_ratio", "resolution", "reference_images"],
+            unsupportedParameters: [...GROK_UNSUPPORTED_VIDEO_PARAMETERS],
+            referenceCountsKnown: false,
+            mediaConstraints: resolved.grok === "1.5" ? [constraintsFor(0, 0), constraintsFor(1, 1), constraintsFor(2, resolved.limits.maxImages)] : [constraintsFor(0, 0), constraintsFor(1, resolved.limits.maxImages)],
+            acceptsVideoReferences: false,
+            acceptsUploadedAudioReferences: false,
+            issues: resolved.issues.map(videoGenerationIssueText),
+        } : {}),
     };
 }
 
 function runVideoWorkbench(input: SiteToolInput, navigate: NavigateFunction) {
     const configStore = useConfigStore.getState();
+    const patch: Partial<AiConfig> = {};
     const applied: Record<string, unknown> = {};
     if (typeof input.model === "string" && input.model.trim()) {
-        const value = normalizeModelOptionValue(input.model, configStore.config.channels) || input.model;
-        configStore.updateConfig("videoModel", value);
-        applied.model = value;
+        patch.videoModel = normalizeModelOptionValue(input.model, configStore.config.channels) || input.model;
+        applied.model = patch.videoModel;
     }
-    if (typeof input.size === "string" && input.size.trim()) {
-        configStore.updateConfig("size", input.size);
+    const grok = getGrokVideoModel({ ...configStore.config, model: patch.videoModel || configStore.config.videoModel || configStore.config.model });
+    const unsupported = grok ? GROK_UNSUPPORTED_VIDEO_PARAMETERS.filter((key) => Object.prototype.hasOwnProperty.call(input, key)) : [];
+    if (unsupported.length) throw new Error(i18n.t("videoCapabilities.unsupportedParameters", { parameters: unsupported.join(", ") }));
+    if (typeof input.size === "string" && (grok || input.size.trim())) {
+        patch.size = input.size;
         applied.size = input.size;
     }
-    if (input.seconds != null && String(input.seconds).trim()) {
-        const seconds = clampVideoSeconds(String(input.seconds));
-        configStore.updateConfig("videoSeconds", seconds);
-        applied.seconds = seconds;
-    }
-    if (typeof input.resolution === "string" && input.resolution.trim()) {
-        configStore.updateConfig("vquality", input.resolution);
+    if (input.seconds != null && (grok || String(input.seconds).trim())) patch.videoSeconds = String(input.seconds);
+    if (typeof input.resolution === "string" && (grok || input.resolution.trim())) {
+        patch.vquality = input.resolution;
         applied.resolution = input.resolution;
     }
     if (typeof input.generateAudio === "boolean") {
-        configStore.updateConfig("videoGenerateAudio", String(input.generateAudio));
+        patch.videoGenerateAudio = String(input.generateAudio);
         applied.generateAudio = input.generateAudio;
     }
     if (typeof input.watermark === "boolean") {
-        configStore.updateConfig("videoWatermark", String(input.watermark));
+        patch.videoWatermark = String(input.watermark);
         applied.watermark = input.watermark;
     }
-    if (input.mode === "frames" || input.mode === "reference") {
-        configStore.updateConfig("videoMode", input.mode);
+    if (typeof input.mode === "string" && (input.mode === "frames" || input.mode === "reference")) {
+        patch.videoMode = input.mode;
         applied.mode = input.mode;
     }
+    const nextConfig = { ...configStore.config, ...patch, model: patch.videoModel || configStore.config.videoModel || configStore.config.model };
+    // Workbench-local references are validated by the workbench when it receives the command.
+    const resolved = assertVideoGenerationConfig(nextConfig);
+    if (patch.videoSeconds !== undefined) {
+        patch.videoSeconds = resolved.seconds;
+        applied.seconds = patch.videoSeconds;
+    }
+    useConfigStore.setState((state) => ({ config: { ...state.config, ...patch } }));
     const prompt = typeof input.prompt === "string" ? input.prompt : undefined;
     const run = input.run !== false;
     navigate("/video");

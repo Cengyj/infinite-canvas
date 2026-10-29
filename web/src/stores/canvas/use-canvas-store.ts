@@ -138,8 +138,8 @@ export const useCanvasStore = create<CanvasStore>()(
                     projects: state.projects,
                     deletedProjects: state.deletedProjects,
                 }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => () => {
-                useCanvasStore.setState({ hydrated: true });
+            onRehydrateStorage: () => (_state, error) => {
+                if (!error) useCanvasStore.setState({ hydrated: true });
             },
         },
     ),
